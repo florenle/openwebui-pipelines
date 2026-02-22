@@ -13,7 +13,7 @@ def save_attachment(file_data: dict, base_path: str, chat_id: str) -> str:
     # 1. Force check the base_path (/home/florenle/x/dev/openwebui/chats)
     # If this was deleted on host, the container mount might be broken
     if not os.path.exists(base_path):
-        print(f"DEBUG: Base path {base_path} missing. Attempting to recreate...")
+        print(f"LFDEBUG: Base path {base_path} missing. Attempting to recreate...")
         os.makedirs(base_path, exist_ok=True)
 
     # 2. Build the target directory: chats/chat_<id>/docs/

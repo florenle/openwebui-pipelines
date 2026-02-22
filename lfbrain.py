@@ -42,20 +42,29 @@ class Pipeline:
                     full_path = os.path.join(upload_dir, matched[0])
                     file_info["path"] = full_path
             except Exception as e:
-                print(f"DEBUG: Directory scan error: {e}")
+                print(f"LFDEBUG: Directory scan error: {e}")
 
             try:
-                saved_path = save_attachment(
-                    file_item, self.valves.target_directory, chat_folder_name
+                # LF: check if file already exists in target directory
+                chat_dir = os.path.join(self.valves.target_directory, chat_folder_name)
+                existing = (
+                    [f for f in os.listdir(chat_dir) if f.startswith(file_id)]
+                    if os.path.exists(chat_dir)
+                    else []
                 )
-                print(f"File successfully saved to: {saved_path}")
-                # LF: inject saved_path into body for pipe to use
+                if existing:
+                    saved_path = os.path.join(chat_dir, existing[0])
+                    print(f"LFDEBUG: File already exists: {saved_path}")
+                else:
+                    saved_path = save_attachment(
+                        file_item, self.valves.target_directory, chat_folder_name
+                    )
+                    print(f"LFDEBUG: File successfully saved to: {saved_path}")
                 body["lfbrain_saved_path"] = saved_path
             except Exception as e:
-                print(f"Error saving file: {e}")
+                print(f"LFDEBUG: Error saving file: {e}")
 
         return body
-
 
     def pipe(
         self,
@@ -68,13 +77,15 @@ class Pipeline:
         import time
         from datetime import datetime
 
+        print(f"LFDEBUG: pipe body keys: {list(body.keys())}")
+
         def ts():
             return datetime.now().strftime("%H:%M:%S")
 
         saved_path = body.get("lfbrain_saved_path")
         if not saved_path:
-            yield f"{ts()} ; No file found. Please upload a file."
-            return
+            yield ""
+            return # LF: no file in this call, silently ignore
 
         # POST to orchestrator
         with httpx.Client() as client:
@@ -116,7 +127,5 @@ class Pipeline:
                     return
 
                 time.sleep(1)
-
-
 
         return asyncio.run(_run())
