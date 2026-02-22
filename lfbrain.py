@@ -1,13 +1,31 @@
+# lfbrain.py
+# Status: Stable
+# Role: Main pipeline class. Coordinates inlet, pipe, and outlet using lfutils.
+#
+# Key Functions:
+#   inlet(): Copies uploaded files, updates context.json with messages.
+#   pipe(): Submits job to orchestrator, streams status updates.
+#   outlet(): Captures assistant response, appends to context.json.
+#
+# Dependencies:
+#   lfb_OwuiFileHandler, lfb_context, lfb_orchestrator, lfb_outlet
+#
+# Dev Notes:
+#   pipe() is a sync Generator - async pipe is not supported in pipelines framework.
+#   __event_emitter__ is not supported in pipelines framework.
+
 import os
 import sys
-import asyncio
-import httpx
-from pathlib import Path
+import time
+from datetime import datetime
 from pydantic import BaseModel
-from typing import Union, Generator, Iterator
+from typing import Iterator
 
 sys.path.append("/app/pipelines/lfutils")
-from lfb_OwuiFileHandler import save_attachment
+from lfb_OwuiFileHandler import handle_file_uploads
+from lfb_context import update_messages
+from lfb_orchestrator import submit_job, stream_job
+from lfb_outlet import save_assistant_response
 
 
 class Pipeline:
@@ -15,56 +33,35 @@ class Pipeline:
         target_directory: str = "/home/florenle/x/dev/openwebui/chats"
 
     def __init__(self):
-        self.file_handler = True
+        # self.file_handler = True
+        # self.pipelines = [{"id": "lfbrain", "name": "lfbrain"}]
         self.id = "lfbrain"
-        self.name = "lfbrain test"
+        self.name = "Welcome to lfbrain"
         self.valves = self.Valves()
-        self.pipelines = [{"id": "lfbrain1", "name": "lfbrain test"}]
         self.orchestrator_url = "http://lfbrain-orchestrator:8081"
 
+    def ts(self):
+        return datetime.now().strftime("%H:%M:%S")
+
+    def get_chat_dir(self, chat_id: str) -> str:
+        return os.path.join(self.valves.target_directory, f"chat_{chat_id}")
+
+
     async def inlet(self, body: dict, __user__: dict) -> dict:
-        files = body.get("files", [])
         chat_id = (
             body.get("chat_id") or body.get("metadata", {}).get("chat_id") or "unknown"
         )
-        chat_folder_name = f"chat_{chat_id}"
-
-        for file_item in files:
-            file_info = file_item.get("file", {})
-            file_id = file_info.get("id")
-            if not file_id:
-                continue
-
-            upload_dir = "/app/backend/data/uploads"
-            try:
-                matched = [f for f in os.listdir(upload_dir) if f.startswith(file_id)]
-                if matched:
-                    full_path = os.path.join(upload_dir, matched[0])
-                    file_info["path"] = full_path
-            except Exception as e:
-                print(f"LFDEBUG: Directory scan error: {e}")
-
-            try:
-                # LF: check if file already exists in target directory
-                chat_dir = os.path.join(self.valves.target_directory, chat_folder_name)
-                existing = (
-                    [f for f in os.listdir(chat_dir) if f.startswith(file_id)]
-                    if os.path.exists(chat_dir)
-                    else []
-                )
-                if existing:
-                    saved_path = os.path.join(chat_dir, existing[0])
-                    print(f"LFDEBUG: File already exists: {saved_path}")
-                else:
-                    saved_path = save_attachment(
-                        file_item, self.valves.target_directory, chat_folder_name
-                    )
-                    print(f"LFDEBUG: File successfully saved to: {saved_path}")
-                body["lfbrain_saved_path"] = saved_path
-            except Exception as e:
-                print(f"LFDEBUG: Error saving file: {e}")
-
+        chat_dir = self.get_chat_dir(chat_id)
+        handle_file_uploads(
+            body.get("files", []),
+            "/app/backend/data/uploads",
+            self.valves.target_directory,
+            chat_id,
+        )
+        update_messages(chat_dir, chat_id, body.get("messages", []))
+        body["lfbrain_chat_id"] = chat_id
         return body
+
 
     def pipe(
         self,
@@ -74,58 +71,34 @@ class Pipeline:
         body: dict,
         __event_emitter__=None,
     ) -> Iterator:
-        import time
-        from datetime import datetime
+        chat_id = body.get("lfbrain_chat_id")
+        if not chat_id:
+            yield "No chat context found."
+            return
+        try:
+            job_id = submit_job(self.orchestrator_url, chat_id)
+            yield f"{self.ts()} ; Job submitted (id: {job_id[:8]}...)\n"
+        except Exception as e:
+            yield f"{self.ts()} ; Orchestrator error: {str(e)}"
+            return
+        yield from stream_job(self.orchestrator_url, job_id, self.ts)
 
-        print(f"LFDEBUG: pipe body keys: {list(body.keys())}")
 
-        def ts():
-            return datetime.now().strftime("%H:%M:%S")
-
-        saved_path = body.get("lfbrain_saved_path")
-        if not saved_path:
-            yield ""
-            return # LF: no file in this call, silently ignore
-
-        # POST to orchestrator
-        with httpx.Client() as client:
-            try:
-                response = client.post(
-                    f"{self.orchestrator_url}/process",
-                    json={"file_path": saved_path, "query": user_message},
-                )
-                job_id = response.json().get("job_id")
-                yield f"{ts()} ; Job submitted (id: {job_id[:8]}...)\n"
-            except Exception as e:
-                yield f"{ts()} ; Orchestrator error: {str(e)}"
-                return
-
-            # Poll status
-            last_status = None
-            while True:
-                try:
-                    response = client.get(
-                        f"{self.orchestrator_url}/status/{job_id}", timeout=30.0
-                    )
-                    data = response.json()
-                    status = data.get("status")
-
-                    if status != last_status:
-                        yield f"{ts()} ; Status: {status}\n"
-                        last_status = status
-
-                    if status == "completed":
-                        yield f"{ts()} ; Result: {data.get('result', 'Done.')}"
-                        return
-
-                    if status == "failed":
-                        yield f"{ts()} ; Failed: {data.get('result')}"
-                        return
-
-                except Exception as e:
-                    yield f"{ts()} ; Polling error: {str(e)}"
-                    return
-
-                time.sleep(1)
-
-        return asyncio.run(_run())
+    async def outlet(self, body: dict, __user__: dict) -> dict:
+        chat_id = (
+            body.get("lfbrain_chat_id")
+            or body.get("chat_id")
+            or body.get("metadata", {}).get("chat_id")
+        )
+        if not chat_id:
+            return body
+        assistant_messages = [
+            m for m in body.get("messages", []) if m.get("role") == "assistant"
+        ]
+        if assistant_messages:
+            save_assistant_response(
+                self.get_chat_dir(chat_id),
+                chat_id,
+                assistant_messages[-1].get("content", ""),
+            )
+        return body
