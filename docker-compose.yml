@@ -9,18 +9,17 @@ services:
       - "host.docker.internal:host-gateway"
     volumes:
       - open-webui-data:/app/backend/data
-      # Modifies openwebui source code.
-      # - /home/florenle/x/dev/openwebui/files_modified.py:/app/backend/open_webui/routers/files.py
     environment:
       - 'OPENAI_API_BASE_URL=http://pipelines:9099/api/v1'
       - 'OPENAI_API_KEY=0p3n-w3bu!'
       - 'HTTP_TIMEOUT=500'
-      - 'SKIP_PROCESSING_MODELS=lfbrain'    # LF: skip RAG processing for lfbrain pipeline
+      - 'SKIP_PROCESSING_MODELS=lfbrain'
     depends_on:
       - pipelines
     restart: always
     networks:
       - backend-net
+
   pipelines:
     image: ghcr.io/open-webui/pipelines:main
     container_name: pipelines
@@ -28,19 +27,27 @@ services:
       - "9099:9099"
     volumes:
       - ./pipelines:/app/pipelines
-      - open-webui-data:/app/backend/data:ro 
-      # :ro means 'read-only' - safer for the pipeline to just read uploads
+      - open-webui-data:/app/backend/data:ro
       - /home/florenle/x/dev/openwebui/chats:/home/florenle/x/dev/openwebui/chats
     environment:
-      # Use a mapping format for environment variables
       WATCH: "True"
-      # This is crucial for large files; it prevents the worker from killing the process
       GUNICORN_TIMEOUT: "500"
     restart: always
     networks:
       - backend-net
+
+  lfbrain-orchestrator:
+    build: ./lfbrain-orchestrator
+    container_name: lfbrain-orchestrator
+    ports:
+      - "8081:8081"
+    restart: unless-stopped
+    networks:
+      - backend-net
+
 networks:
   backend-net:
     driver: bridge
+
 volumes:
   open-webui-data:
