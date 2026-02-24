@@ -1,6 +1,9 @@
+# docker-compose.yml
+# Stack: open-webui, pipelines, lfbrain-orchestrator
+# Location: lfbrain-pipeline/docker-compose.yml
+
 services:
   open-webui:
-    #Was: image: ghcr.io/open-webui/open-webui:main
     image: my-open-webui:latest
     container_name: open-webui
     ports:
@@ -26,7 +29,6 @@ services:
     ports:
       - "9099:9099"
     volumes:
-      - ./pipelines:/app/pipelines
       - open-webui-data:/app/backend/data:ro
       - /home/florenle/x/dev/openwebui/chats:/home/florenle/x/dev/openwebui/chats
     environment:
@@ -37,7 +39,7 @@ services:
       - backend-net
 
   lfbrain-orchestrator:
-    build: ./lfbrain-orchestrator
+    build: /home/florenle/x/dev/openwebui/lfbrain-orchestrator
     container_name: lfbrain-orchestrator
     ports:
       - "8081:8081"
@@ -51,3 +53,5 @@ networks:
 
 volumes:
   open-webui-data:
+    external: true
+    name: openwebui_open-webui-data
