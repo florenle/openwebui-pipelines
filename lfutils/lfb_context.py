@@ -33,7 +33,8 @@ def load_context(chat_dir: str) -> dict:
         "messages": [],
         "metadata": {
             "created_at": None,
-            "last_updated": None
+            "last_updated": None,
+            "title": None
         }
     }
 
@@ -50,4 +51,10 @@ def update_messages(chat_dir: str, chat_id: str, messages: list):
     context = load_context(chat_dir)
     context["chat_id"] = chat_id
     context["messages"] = messages
+    save_context(chat_dir, context)
+
+def update_title(chat_dir: str, chat_id: str, title: str):
+    context = load_context(chat_dir)
+    context["chat_id"] = chat_id
+    context["metadata"]["title"] = title
     save_context(chat_dir, context)

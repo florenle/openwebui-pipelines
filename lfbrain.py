@@ -23,7 +23,7 @@ from typing import Iterator
 
 sys.path.append("/app/pipelines/lfutils")
 from lfb_OwuiFileHandler import handle_file_uploads
-from lfb_context import update_messages
+from lfb_context import update_messages, update_title
 from lfb_orchestrator import submit_job, stream_job
 from lfb_outlet import save_assistant_response
 
@@ -62,6 +62,9 @@ class Pipeline:
             chat_id,
         )
         update_messages(chat_dir, chat_id, body.get("messages", []))
+        title = body.get("metadata", {}).get("title")
+        if title:
+            update_title(chat_dir, chat_id, title)        
         body["lfbrain_chat_id"] = chat_id
         return body
 
