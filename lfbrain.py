@@ -26,6 +26,7 @@ from lfb_OwuiFileHandler import handle_file_uploads
 from lfb_context import update_messages, update_title
 from lfb_orchestrator import submit_job, stream_job
 from lfb_outlet import save_assistant_response
+from lfb_commands import handle_command
 
 
 class Pipeline:
@@ -84,6 +85,12 @@ class Pipeline:
         if not chat_id:
             yield "No chat context found."
             return
+        
+        # LFB02242026A: intercept slash commands before orchestrator submission
+        if user_message.strip().startswith("/"):
+            yield from handle_command(user_message.strip(), chat_id, self.get_chat_dir(chat_id))
+            return
+             
         try:
             job_id = submit_job(self.orchestrator_url, chat_id)
             yield f"{self.ts()} ; Job submitted (id: {job_id[:8]}...)\n"
