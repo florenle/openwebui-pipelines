@@ -48,8 +48,11 @@ class Pipeline:
 
 
     async def inlet(self, body: dict, __user__: dict) -> dict:
-        print(f"LFDEBUG: inlet body keys: {list(body.keys())}")
-        print(f"LFDEBUG: last message preview: {body.get('messages', [{}])[-1].get('content', '')[:100]}")
+        # print(f"LFDEBUG: inlet body keys: {list(body.keys())}")
+        # print(f"LFDEBUG: last message preview: {body.get('messages', [{}])[-1].get('content', '')[:100]}")
+        # print(f"LFDEBUG: title from metadata: {body.get('metadata', {}).get('title', 'NOT FOUND')}")
+        # print(f"LFDEBUG: metadata keys: {list(body.get('metadata', {}).keys())}")
+        # print(f"LFDEBUG: metadata chat_id: {body.get('metadata', {}).get('chat_id', 'NOT FOUND')}")
     
         chat_id = (
             body.get("chat_id") or body.get("metadata", {}).get("chat_id") or "unknown"
