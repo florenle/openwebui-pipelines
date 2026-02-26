@@ -79,6 +79,10 @@ def init_db():
                 FOREIGN KEY (chat_id) REFERENCES chats(chat_id) ON DELETE CASCADE
             );
         """)
+        # LFB02242026B: clean up orphaned jobs from previous crash
+        conn.execute(
+            "UPDATE jobs SET status = 'failed', error = 'orphaned at startup' WHERE status = 'running'"
+        )        
     conn.close()
 
 

@@ -9,6 +9,7 @@
 #   update_job_status(job_id, status, error): Updates status and optionally error.
 #   set_killme(job_id): Sets killme=1 for a given job.
 #   delete_job(job_id): Removes job row on completion or failure.
+#   get_active_job_by_chat(chat_id): Returns most recent job with status='running' for chat.
 #
 # Dependencies:
 #   lfb_sqlite: get_conn()
@@ -78,3 +79,13 @@ def delete_job(job_id):
     with conn:
         conn.execute("DELETE FROM jobs WHERE job_id = ?", (job_id,))
     conn.close()
+
+
+def get_active_job_by_chat(chat_id):
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT * FROM jobs WHERE chat_id = ? AND status = 'running' ORDER BY created_at DESC LIMIT 1",
+        (chat_id,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
