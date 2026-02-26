@@ -27,6 +27,7 @@ from lfb_context import update_messages, update_title
 from lfb_orchestrator import submit_job, stream_job
 from lfb_outlet import save_assistant_response
 from lfb_commands import handle_command
+from lfb_sqlite import init_db  # LFB02242026B - initialize database on startup
 
 
 class Pipeline:
@@ -34,6 +35,8 @@ class Pipeline:
         target_directory: str = "/home/florenle/x/dev/openwebui/chats"
 
     def __init__(self):
+        # Initialize the database on startup
+        init_db()
         # self.file_handler = True
         # self.pipelines = [{"id": "lfbrain", "name": "lfbrain"}]
         self.id = "lfbrain"
