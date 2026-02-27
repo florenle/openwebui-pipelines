@@ -1,0 +1,6 @@
+// pyrightconfig.json
+{
+  "extraPaths": [
+    "lfutils"
+  ]
+}

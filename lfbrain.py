@@ -4,17 +4,17 @@
 #
 # Key Functions:
 #   inlet(): Copies uploaded files, creates chat in DB, updates title.
-#   pipe(): Creates block, submits job, streams status updates, writes system content.
-#   outlet(): Captures assistant response, finalizes block, deletes job row.
+#   pipe(): Creates block, submits job, streams status updates, writes system/assistant content.
+#   outlet(): No-op — all DB writes handled in pipe().
 #
 # Dependencies:
 #   lfb_OwuiFileHandler, lfb_sqlite, lfb_sqlite_blocks, lfb_sqlite_jobs,
-#   lfb_orchestrator, lfb_outlet, lfb_commands, lfb_log
+#   lfb_orchestrator, lfb_commands, lfb_log
 #
 # Dev Notes:
 #   pipe() is a sync Generator - async pipe is not supported in pipelines framework.
 #   __event_emitter__ is not supported in pipelines framework.
-#   block_id looked up in outlet() via active job — no instance state needed.
+#   stream_job() yields ("result", value) or ("failed", value) sentinels.
 #   GeneratorExit handled in pipe() for stop button press.
 
 import os
@@ -27,10 +27,9 @@ from typing import Iterator
 sys.path.append("/app/pipelines/lfutils")
 from lfb_OwuiFileHandler import handle_file_uploads
 from lfb_sqlite import init_db, create_chat, update_chat_title
-from lfb_sqlite_blocks import add_block, update_block_system
+from lfb_sqlite_blocks import add_block, update_block_system, update_block_assistant
 from lfb_sqlite_jobs import create_job
 from lfb_orchestrator import submit_job, stream_job
-from lfb_outlet import save_assistant_response
 from lfb_commands import handle_command
 from lfb_log import log
 
@@ -71,6 +70,7 @@ class Pipeline:
         log("lfbrain", f"inlet complete — chat_id={chat_id}, title={title}")
         return body
 
+
     def pipe(
         self,
         user_message: str,
@@ -106,32 +106,34 @@ class Pipeline:
             return
 
         # LFB02242026B: accumulate system content, write once at end
+        # result tuple from stream_job: ("result", value) or ("failed", value)
         system_lines = []
+        assistant_result = None
         try:
-            for line in stream_job(self.orchestrator_url, job_id, self.ts):
-                system_lines.append(line)
-                yield line
+            for item in stream_job(self.orchestrator_url, job_id, self.ts):
+                if isinstance(item, tuple) and item[0] == "result":
+                    assistant_result = item[1]
+                    yield assistant_result
+                elif isinstance(item, tuple) and item[0] == "failed":
+                    assistant_result = f"FAILED: {item[1]}"
+                    system_lines.append(f"{self.ts()} ; Failed: {item[1]}\n")
+                    yield f"{self.ts()} ; Failed: {item[1]}"
+                else:
+                    system_lines.append(item)
+                    yield item
         except GeneratorExit:
             log("lfbrain", "pipe — GeneratorExit: stream interrupted by user")
             system_lines.append(f"{self.ts()} ; Stream interrupted by user\n")
+            assistant_result = assistant_result or "FAILED: interrupted by user"
         finally:
             log("lfbrain", f"pipe — writing system content ({len(system_lines)} lines)")
             update_block_system(block_id, "".join(system_lines))
+            if assistant_result:
+                log("lfbrain", f"pipe — writing assistant result len={len(assistant_result)}")
+                update_block_assistant(block_id, assistant_result)
+
 
     async def outlet(self, body: dict, __user__: dict) -> dict:
-        chat_id = (
-            body.get("lfbrain_chat_id")
-            or body.get("chat_id")
-            or body.get("metadata", {}).get("chat_id")
-        )
-        log("lfbrain", f"outlet(chat_id={chat_id})")
-        if not chat_id:
-            return body
-        assistant_messages = [
-            m for m in body.get("messages", []) if m.get("role") == "assistant"
-        ]
-        if assistant_messages:
-            content = assistant_messages[-1].get("content", "")
-            log("lfbrain", f"outlet — saving assistant response len={len(content)}")
-            save_assistant_response(chat_id, content)
+        log("lfbrain", "outlet() — no-op, DB writes handled in pipe()")
         return body
+    

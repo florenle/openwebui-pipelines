@@ -34,6 +34,7 @@ services:
     environment:
       WATCH: "True"
       GUNICORN_TIMEOUT: "500"
+      DEBUG: "true"
     restart: always
     networks:
       - backend-net

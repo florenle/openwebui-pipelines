@@ -60,14 +60,15 @@ def stream_job(orchestrator_url: str, job_id: str, ts):
                 yield f"{ts()} ; Progress: {result}\n"
             elif status == "completed":
                 log("lfb_orchestrator", f"stream_job completed: {result}")
-                yield f"{ts()} ; Result: {result or 'Done.'}"
+                yield ("result", result or "Done.")
                 return
             elif status == "failed":
                 log("lfb_orchestrator", f"stream_job failed: {result}")
-                yield f"{ts()} ; Failed: {result}"
+                yield ("failed", result or "Unknown error.")
                 return
         except Exception as e:
             log("lfb_orchestrator", f"polling error: {e}")
             yield f"{ts()} ; Polling error: {str(e)}"
             return
         time.sleep(1)
+
