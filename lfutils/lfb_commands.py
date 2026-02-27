@@ -1,42 +1,46 @@
 # lfb_commands.py
-# Status: Stable
+# Status: In Development
 # Role: Handles slash commands entered by the user in chat.
 #
 # Key Functions:
-#   handle_command(command, chat_id, chat_dir): Dispatches slash commands, yields response lines.
+#   handle_command(command, chat_id): Dispatches slash commands, yields response lines.
 #
 # Dependencies:
-#   lfb_context
+#   lfb_sqlite: get_chat()
+#   lfb_sqlite_docs: get_docs_by_chat()
 #
 # Dev Notes:
 #   Called from pipe() in lfbrain.py before orchestrator submission.
 #   Returns a generator — must yield at least one line.
+#   Slash command turns are never written to DB.
+#   chat_dir no longer needed — all data from SQLite.
 
-import os
+from lfb_sqlite import get_chat
+from lfb_sqlite_docs import get_docs_by_chat
 
-from lfb_context import load_context
 
-def handle_command(command: str, chat_id: str, chat_dir: str):
-    cmd = command.strip().lower()
+def handle_command(command: str, chat_id: str):
+    parts = command.strip().split()
+    cmd = parts[0].lower()
 
     if cmd == "/info":
-        context = load_context(chat_dir)
-        title = context.get("metadata", {}).get("title") or "Untitled"
-        summary = context.get("metadata", {}).get("summary") or title
-        
-        # LFB02242026A: list docs from chat docs/ folder
-        docs_dir = os.path.join(chat_dir, "docs")
-        if os.path.exists(docs_dir):
-            docs = os.listdir(docs_dir)
-        else:
-            docs = []
-        docs_str = ", ".join(docs) if docs else "none"
-
-        yield f"**Chat ID:** {chat_id}\n"
-        yield f"**Title:** {title}\n"
-        yield f"**Summary:** {summary}\n"
-        yield f"**Docs:** {docs_str}\n"
+        yield from _cmd_info(chat_id)
         return
 
     yield f"Unknown command: `{command}`\n"
     yield "Available commands: `/info`\n"
+
+
+def _cmd_info(chat_id: str):
+    chat = get_chat(chat_id)
+    if not chat:
+        yield f"No chat found for ID: {chat_id}\n"
+        return
+    title = chat.get("title") or "Untitled"
+    summary = chat.get("summary") or title
+    docs = get_docs_by_chat(chat_id)
+    docs_str = ", ".join(d["filename"] for d in docs) if docs else "none"
+    yield f"**Chat ID:** {chat_id}\n"
+    yield f"**Title:** {title}\n"
+    yield f"**Summary:** {summary}\n"
+    yield f"**Docs:** {docs_str}\n"
