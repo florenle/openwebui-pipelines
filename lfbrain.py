@@ -39,9 +39,10 @@ from lfb_log import log
 class Pipeline:
     class Valves(BaseModel):
         target_directory: str = "/home/florenle/x/dev/openwebui/chats"
+        openwebui_api_key: str = "0p3n-w3bu!"
 
     def __init__(self):
-        init_db()  # LFB02242026B: initialize SQLite DB at pipeline startup
+        init_db()
         self.id = "lfbrain"
         self.name = "Welcome to lfbrain"
         self.valves = self.Valves()
@@ -68,10 +69,9 @@ class Pipeline:
             self.valves.target_directory,
             chat_id,
         )
-        body["lfbrain_chat_id"] = chat_id  # LFB: pipe() cannot access chat_id directly
+        body["lfbrain_chat_id"] = chat_id
         log("lfbrain", f"inlet complete — chat_id={chat_id}, title={title}")
         return body
-
 
     def pipe(
         self,
@@ -87,13 +87,11 @@ class Pipeline:
             yield "No chat context found."
             return
 
-        # LFB02242026A: intercept slash commands before orchestrator submission
         if user_message.strip().startswith("/"):
             log("lfbrain", f"pipe — slash command intercepted: {user_message.strip()}")
-            yield from handle_command(user_message.strip(), chat_id)
+            yield from handle_command(user_message.strip(), chat_id, self.valves.openwebui_api_key)
             return
 
-        # LFB02242026B: create block and job before submitting to orchestrator
         block_id = str(uuid.uuid4())
         log("lfbrain", f"pipe — new block_id={block_id[:8]}...")
         add_block(chat_id, block_id, user_message)
@@ -103,15 +101,13 @@ class Pipeline:
             create_job(job_id, block_id, chat_id)
             job_submitted_line = f"{self.ts()} ; Job submitted (id: {job_id[:8]}...)\n"
             system_lines: list[str] = []
-            system_lines.append(job_submitted_line)  # LFB02242026B: capture in system_content
+            system_lines.append(job_submitted_line)
             yield job_submitted_line
         except Exception as e:
             log("lfbrain", f"pipe — orchestrator error: {e}")
             yield f"{self.ts()} ; Orchestrator error: {str(e)}"
             return
 
-        # LFB02242026B: accumulate system content, write once at end
-        # result tuple from stream_job: ("result", value) or ("failed", value)
         system_lines = []
         assistant_result = None
         try:
@@ -136,7 +132,6 @@ class Pipeline:
             if assistant_result:
                 log("lfbrain", f"pipe — writing assistant result len={len(assistant_result)}")
                 update_block_assistant(block_id, assistant_result)
-
 
     async def outlet(self, body: dict, __user__: dict) -> dict:
         chat_id = body.get("chat_id") or body.get("metadata", {}).get("chat_id")
