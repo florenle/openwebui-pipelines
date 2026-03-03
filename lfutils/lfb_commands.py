@@ -47,6 +47,7 @@ def handle_command(command: str, chat_id: str, api_key: str = ""):
     yield f"Unknown command: `{command}`\n"
     yield "Available commands: `/info`, `/load`\n"
 
+
 def _cmd_info(chat_id: str):
     log("lfb_commands", f"_cmd_info({chat_id})")
     chat = get_chat(chat_id)

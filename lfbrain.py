@@ -83,6 +83,7 @@ class Pipeline:
     ) -> Iterator:
         chat_id = body.get("lfbrain_chat_id")
         log("lfbrain", f"pipe(chat_id={chat_id}, msg={user_message[:40]}...)")
+        log("lfbrain", f"pipe — messages: {body.get('messages', [])[:2]}")
         if not chat_id:
             yield "No chat context found."
             return

@@ -5,6 +5,7 @@
 #
 # Key Functions:
 #   add_block(chat_id, block_id, user_content): Inserts new block, auto-assigns next seq.
+#   add_block_full(chat_id, block_id, user_content, system_content, assistant_content): Inserts complete block in one call.
 #   get_block(block_id): Returns block row or None.
 #   get_blocks_by_chat(chat_id): Returns all blocks for a chat ordered by seq.
 #   update_block_system(block_id, system_content): Stores job status stream.
@@ -18,18 +19,16 @@
 # Dev Notes:
 #   seq is auto-assigned as max(seq)+1 per chat at insert time
 #   block_id is a UUID generated in pipe() at job submission time
-#   Slash command turns are never stored — no block is created for them
+#   add_block_full() used by loadAsHistory to insert source blocks in one call
 
 from datetime import datetime, timezone
 from lfb_sqlite import get_conn
 from lfb_log import log
 
-
 def _now():
     return datetime.now(timezone.utc).isoformat()
 
-
-def add_block(chat_id, block_id, user_content):
+def add_block(chat_id, block_id, user_content, system_content=None, assistant_content=None):
     log("lfb_sqlite_blocks", f"add_block({chat_id}, {block_id[:8]}...)")
     conn = get_conn()
     with conn:
@@ -39,14 +38,13 @@ def add_block(chat_id, block_id, user_content):
         ).fetchone()
         next_seq = row["next_seq"]
         conn.execute(
-            """INSERT INTO blocks (block_id, chat_id, seq, user_content, created_at)
-               VALUES (?, ?, ?, ?, ?)""",
-            (block_id, chat_id, next_seq, user_content, _now())
+            """INSERT INTO blocks (block_id, chat_id, seq, user_content, system_content, assistant_content, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (block_id, chat_id, next_seq, user_content, system_content, assistant_content, _now())
         )
     conn.close()
     log("lfb_sqlite_blocks", f"add_block → seq={next_seq}")
     return next_seq
-
 
 def get_block(block_id):
     log("lfb_sqlite_blocks", f"get_block({block_id[:8]}...)")
@@ -54,7 +52,6 @@ def get_block(block_id):
     row = conn.execute("SELECT * FROM blocks WHERE block_id = ?", (block_id,)).fetchone()
     conn.close()
     return dict(row) if row else None
-
 
 def get_blocks_by_chat(chat_id):
     log("lfb_sqlite_blocks", f"get_blocks_by_chat({chat_id})")
@@ -66,7 +63,6 @@ def get_blocks_by_chat(chat_id):
     log("lfb_sqlite_blocks", f"get_blocks_by_chat → {len(rows)} blocks")
     return [dict(r) for r in rows]
 
-
 def update_block_system(block_id, system_content):
     log("lfb_sqlite_blocks", f"update_block_system({block_id[:8]}...)")
     conn = get_conn()
@@ -77,7 +73,6 @@ def update_block_system(block_id, system_content):
         )
     conn.close()
 
-
 def update_block_assistant(block_id, assistant_content):
     log("lfb_sqlite_blocks", f"update_block_assistant({block_id[:8]}...) len={len(assistant_content)}")
     conn = get_conn()
@@ -87,7 +82,6 @@ def update_block_assistant(block_id, assistant_content):
             (assistant_content, block_id)
         )
     conn.close()
-
 
 def delete_blocks_by_seq_range(chat_id, seqs):
     log("lfb_sqlite_blocks", f"delete_blocks_by_seq_range({chat_id}, {seqs})")
