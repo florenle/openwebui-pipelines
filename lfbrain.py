@@ -3,10 +3,11 @@
 # Role: Main pipeline class. Coordinates inlet, pipe, and outlet using lfutils.
 #
 # Key Functions:
-#   inlet(): Copies uploaded files, creates chat in DB, updates title.
-#   pipe(): Creates block, submits job, streams status updates, writes system/assistant content.
-#           Slash command turns are written as blocks same as regular turns.
-#   outlet(): Deletes active job on completion.
+#   inlet(): Branch-safe sync of SQLite against body["messages"]. Creates chat,
+#            updates title, handles file uploads, injects lfbrain_chat_id, strips message ids.
+#   pipe(): Creates block, submits job, streams status as <think>...</think>,
+#           writes assistant content. Slash commands handled inline.
+#   outlet(): True no-op except delete_job().
 #
 # Dependencies:
 #   lfb_OwuiFileHandler, lfb_sqlite, lfb_sqlite_blocks, lfb_sqlite_jobs,
@@ -19,10 +20,13 @@
 #   GeneratorExit handled in pipe() for stop button press.
 #   lfbrain_chat_id is injected by inlet() into body — pipe() cannot access chat_id directly.
 #   outlet() uses body.get("chat_id") directly — OpenWebUI always provides it there.
-#   Slash command turns are written as blocks (user_content=command, assistant_content=output).
-#   rewrite_chat_history() called only by commands that modify block structure (/loadAsHistory, /rmb).
+#   system_content is ephemeral — streamed as <think>...</think>, never stored.
+#   owui_message_id is the sync key for branch reconciliation.
+#
+# Schema: LFB03042026A
 
 import os
+import re
 import sys
 import uuid
 from datetime import datetime
@@ -31,12 +35,61 @@ from typing import Iterator
 
 sys.path.append("/app/pipelines/lfutils")
 from lfb_OwuiFileHandler import handle_file_uploads
-from lfb_sqlite import init_db, create_chat, update_chat_title
-from lfb_sqlite_blocks import add_block, update_block_system, update_block_assistant
+from lfb_sqlite import init_db, create_chat, update_chat_title, clear_chat_summaries
+from lfb_sqlite_blocks import (
+    add_block,
+    update_block_assistant,
+    get_blocks_by_chat,
+    upsert_block,
+    delete_blocks_from_seq,
+)
 from lfb_sqlite_jobs import create_job, get_active_job_by_chat, delete_job
 from lfb_orchestrator import submit_job, stream_job
 from lfb_commands import handle_command
 from lfb_log import log
+
+
+def remove_details(content: str) -> str:
+    return re.sub(r'<details[^>]*>.*?</details>', '', content, flags=re.DOTALL).strip()
+
+
+def sync_blocks(chat_id: str, body_messages: list[dict]):
+    """Reconcile SQLite blocks against the active branch in body['messages']."""
+    owui_pairs = []
+    for i in range(0, len(body_messages) - 1, 2):
+        user_msg = body_messages[i]
+        assistant_msg = body_messages[i + 1]
+        owui_pairs.append({
+            "owui_message_id": user_msg.get("id"),
+            "user_content": user_msg.get("content", ""),
+            "assistant_content": remove_details(assistant_msg.get("content", "")),
+        })
+
+    db_blocks = get_blocks_by_chat(chat_id)
+
+    divergence = None
+    for i, (owui, db) in enumerate(zip(owui_pairs, db_blocks)):
+        if owui["owui_message_id"] != db.get("owui_message_id"):
+            divergence = i
+            break
+
+    if divergence is None and len(db_blocks) > len(owui_pairs):
+        divergence = len(owui_pairs)
+
+    if divergence is not None:
+        delete_blocks_from_seq(chat_id, divergence + 1)
+        for idx, pair in enumerate(owui_pairs[divergence:]):
+            upsert_block(
+                chat_id,
+                divergence + idx + 1,
+                pair["owui_message_id"],
+                pair["user_content"],
+                pair["assistant_content"],
+            )
+        clear_chat_summaries(chat_id)
+        log("lfbrain", f"sync_blocks — divergence at {divergence}, resynced {len(owui_pairs) - divergence} pairs")
+    else:
+        log("lfbrain", "sync_blocks — no divergence")
 
 
 class Pipeline:
@@ -62,17 +115,31 @@ class Pipeline:
             body.get("chat_id") or body.get("metadata", {}).get("chat_id") or "unknown"
         )
         log("lfbrain", f"inlet(chat_id={chat_id})")
+
         create_chat(chat_id)
+
         title = body.get("metadata", {}).get("title")
         if title:
             update_chat_title(chat_id, title)
+
         handle_file_uploads(
             body.get("files", []),
             "/app/backend/data/uploads",
             self.valves.target_directory,
             chat_id,
         )
+
+        # Sync SQLite against active branch — body["messages"] excludes the new incoming message
+        messages = body.get("messages", [])
+        if len(messages) >= 2:
+            sync_blocks(chat_id, messages[:-1] if len(messages) % 2 == 1 else messages)
+
         body["lfbrain_chat_id"] = chat_id
+
+        # Strip id from all messages before passing to LLM
+        for msg in body.get("messages", []):
+            msg.pop("id", None)
+
         log("lfbrain", f"inlet complete — chat_id={chat_id}, title={title}")
         return body
 
@@ -90,9 +157,14 @@ class Pipeline:
             yield "No chat context found."
             return
 
-        # All turns get a block — slash commands and regular jobs alike
+        # owui_message_id: last message in body["messages"] is the current user turn
+        owui_message_id = None
+        raw_messages = body.get("messages", [])
+        if raw_messages:
+            owui_message_id = raw_messages[-1].get("id")
+
         block_id = str(uuid.uuid4())
-        add_block(chat_id, block_id, user_message)
+        add_block(chat_id, block_id, owui_message_id, user_message)
 
         if user_message.strip().startswith("/"):
             log("lfbrain", f"pipe — slash command: {user_message.strip()}")
@@ -109,33 +181,38 @@ class Pipeline:
             job_id = submit_job(self.orchestrator_url, chat_id)
             create_job(job_id, block_id, chat_id)
             job_submitted_line = f"{self.ts()} ; Job submitted (id: {job_id[:8]}...)\n"
-            system_lines: list[str] = [job_submitted_line]
-            yield job_submitted_line
+            yield f"<think>{job_submitted_line}"
         except Exception as e:
             log("lfbrain", f"pipe — orchestrator error: {e}")
-            yield f"{self.ts()} ; Orchestrator error: {str(e)}"
+            yield f"<think>{self.ts()} ; Orchestrator error: {str(e)}</think>"
             return
 
         assistant_result = None
+        think_open = True
         try:
             for item in stream_job(self.orchestrator_url, job_id, self.ts):
                 if isinstance(item, tuple) and item[0] == "result":
+                    if think_open:
+                        yield "</think>"
+                        think_open = False
                     assistant_result = item[1]
                     yield assistant_result
                 elif isinstance(item, tuple) and item[0] == "failed":
+                    error_line = f"{self.ts()} ; Failed: {item[1]}\n"
+                    if think_open:
+                        yield error_line + "</think>"
+                        think_open = False
+                    else:
+                        yield error_line
                     assistant_result = f"FAILED: {item[1]}"
-                    system_lines.append(f"{self.ts()} ; Failed: {item[1]}\n")
-                    yield f"{self.ts()} ; Failed: {item[1]}"
                 else:
-                    system_lines.append(item)
                     yield item
         except GeneratorExit:
             log("lfbrain", "pipe — GeneratorExit: stream interrupted by user")
-            system_lines.append(f"{self.ts()} ; Stream interrupted by user\n")
+            if think_open:
+                yield f"{self.ts()} ; Stream interrupted by user\n</think>"
             assistant_result = assistant_result or "FAILED: interrupted by user"
         finally:
-            log("lfbrain", f"pipe — writing system content ({len(system_lines)} lines)")
-            update_block_system(block_id, "".join(system_lines))
             if assistant_result:
                 log("lfbrain", f"pipe — writing assistant result len={len(assistant_result)}")
                 update_block_assistant(block_id, assistant_result)
