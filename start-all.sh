@@ -53,7 +53,7 @@ else
     echo "To start llama_server:"
     echo "  1. Open a dedicated terminal"
     echo "  2. toolbox enter llama-vulkan-radv"
-    echo "  3. llama-server -m ~/models/gpt-oss-20b/gpt-oss-20b-Q4_K_M.gguf -ngl 999 --host 0.0.0.0 --port 8080 -c 32768"
+    echo "  3. llama-server -m ~/models/gpt-oss-20b/gpt-oss-20b-Q4_K_M.gguf -ngl 999 --host 0.0.0.0 --port 8080 -c 32768 --jinja   --reasoning-format auto   --chat-template-kwargs '{\"reasoning_effort\": \"medium\"}'"
 fi
 
 echo ""
