@@ -17,11 +17,12 @@
 #   pipe() is a sync Generator - async pipe is not supported in pipelines framework.
 #   __event_emitter__ is not supported in pipelines framework.
 #   stream_job() yields ("result", value) or ("failed", value) sentinels.
-#   GeneratorExit handled in pipe() for stop button press.
+#   GeneratorExit handled in pipe() for stop button press — sends kill_job() to orchestrator.
 #   lfbrain_chat_id is injected by inlet() into body — pipe() cannot access chat_id directly.
 #   outlet() uses body.get("chat_id") directly — OpenWebUI always provides it there.
 #   system_content is ephemeral — streamed as <think>...</think>, never stored.
 #   owui_message_id is the sync key for branch reconciliation.
+#   model_hint defaults to "local" — /setmodel command and chat-scoped model selection TBD.
 #
 # Schema: LFB03042026A
 
@@ -44,7 +45,7 @@ from lfb_sqlite_blocks import (
     delete_blocks_from_seq,
 )
 from lfb_sqlite_jobs import create_job, get_active_job_by_chat, delete_job
-from lfb_orchestrator import submit_job, stream_job
+from lfb_orchestrator import submit_job, stream_job, kill_job
 from lfb_commands import handle_command
 from lfb_log import log
 
@@ -109,6 +110,15 @@ class Pipeline:
 
     def get_chat_dir(self, chat_id: str) -> str:
         return os.path.join(self.valves.target_directory, f"chat_{chat_id}")
+
+    def _build_context(self, messages: list[dict]) -> str:
+        """Format messages as Role: content transcript for orchestrator context."""
+        lines = []
+        for msg in messages:
+            role = msg.get("role", "user").capitalize()
+            content = msg.get("content", "")
+            lines.append(f"{role}: {content}")
+        return "\n".join(lines)
 
     async def inlet(self, body: dict, __user__: dict) -> dict:
         chat_id = (
@@ -179,8 +189,14 @@ class Pipeline:
                 update_block_assistant(block_id, "".join(result_lines))
             return
 
+        job_id = None
         try:
-            job_id = submit_job(self.orchestrator_url, chat_id)
+            job_id = submit_job(
+                self.orchestrator_url,
+                query=user_message,
+                context=self._build_context(messages),
+                model_hint="local",  # TODO: read from chat row — /setmodel sprint backlog
+            )
             create_job(job_id, block_id, chat_id)
             job_submitted_line = f"{self.ts()} ; Job submitted (id: {job_id[:8]}...)\n"
             yield f"<think>{job_submitted_line}"
@@ -211,6 +227,12 @@ class Pipeline:
                     yield item
         except GeneratorExit:
             log("lfbrain", "pipe — GeneratorExit: stream interrupted by user")
+            if job_id:
+                try:
+                    kill_job(self.orchestrator_url, job_id)
+                    log("lfbrain", f"pipe — kill_job sent for job_id={job_id[:8]}")
+                except Exception as e:
+                    log("lfbrain", f"pipe — kill_job error: {e}")
             if think_open:
                 yield f"{self.ts()} ; Stream interrupted by user\n</think>"
             assistant_result = assistant_result or "FAILED: interrupted by user"
