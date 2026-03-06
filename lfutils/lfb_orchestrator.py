@@ -3,24 +3,31 @@
 # Role: Handles all HTTP communication between the pipeline and lfbrain-orchestrator.
 #
 # Key Functions:
-#   submit_job(orchestrator_url, query, context, model_hint): POSTs job payload, returns job_id.
-#   poll_status(orchestrator_url, job_id): GETs current job status and result.
-#   stream_job(orchestrator_url, job_id, ts): Generator that yields status log lines and final result.
-#   kill_job(orchestrator_url, job_id): POSTs kill signal to orchestrator.
+#   submit_job(): POSTs job payload to /process, returns job_id. Polling path.
+#   poll_status(): GETs current job status and result from /status/{job_id}.
+#   stream_job(): Generator that polls /status, yields status log lines and final result. Polling path.
+#   stream_job_http(): Async generator. Connects to POST /stream, yields think/token chunks live.
+#   kill_job(): POSTs kill signal to /kill/{job_id}.
 #
 # Dependencies:
 #   httpx, time
 #   lfb_log: log()
 #
 # Dev Notes:
-#   stream_job handles progress, completed, failed and killed statuses.
-#   kill_job wires to /kill/{job_id} endpoint on orchestrator.
-#   model_hint defaults to "local" — chat-scoped model selection TBD via /setmodel.
+#   stream_job_http() is additive — submit_job(), stream_job(), kill_job() polling path stays intact.
+#   stream_job_http() is async — pipe() bridges via asyncio.run_coroutine_threadsafe().
+#   Client disconnect in pipe() (GeneratorExit) closes httpx stream naturally.
+#   SSE format: "data: {json}\n\n". Types: think, token, done, error.
+#
+# Schema: LFB03052026B
 
+import asyncio
+import json
 import time
 import httpx
-from typing import Iterator
+from typing import Iterator, AsyncGenerator
 from lfb_log import log
+
 
 def submit_job(
     orchestrator_url: str,
@@ -76,11 +83,9 @@ def stream_job(orchestrator_url: str, job_id: str, ts) -> Iterator:
             data = poll_status(orchestrator_url, job_id)
             status = data.get("status")
             result = data.get("result")
-
             if status != last_status:
                 yield f"{ts()} ; Status: {status}\n"
                 last_status = status
-
             if status == "progress" and result:
                 yield f"{ts()} ; Progress: {result}\n"
             elif status == "completed":
@@ -95,11 +100,52 @@ def stream_job(orchestrator_url: str, job_id: str, ts) -> Iterator:
                 log("lfb_orchestrator", f"stream_job failed: {result}")
                 yield ("failed", result or "Unknown error.")
                 return
-
         except Exception as e:
             log("lfb_orchestrator", f"polling error: {e}")
             yield f"{ts()} ; Polling error: {str(e)}"
             return
-
         time.sleep(1)
+
+
+async def stream_job_http(
+    orchestrator_url: str,
+    query: str,
+    context: str,
+    model_hint: str,
+) -> AsyncGenerator[tuple[str, str], None]:
+    log("lfb_orchestrator", f"stream_job_http start — model_hint={model_hint} query={query[:40]}...")
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            async with client.stream(
+                "POST",
+                f"{orchestrator_url}/stream",
+                json={
+                    "query": query,
+                    "context": context,
+                    "model_hint": model_hint,
+                },
+            ) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    data_str = line[len("data:"):].strip()
+                    try:
+                        data = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+                    kind = data.get("type")
+                    chunk = data.get("chunk", "")
+                    if kind == "done":
+                        log("lfb_orchestrator", "stream_job_http complete")
+                        return
+                    elif kind == "error":
+                        log("lfb_orchestrator", f"stream_job_http error — {chunk}")
+                        yield ("failed", chunk)
+                        return
+                    elif kind in ("think", "token"):
+                        yield (kind, chunk)
+    except Exception as e:
+        log("lfb_orchestrator", f"stream_job_http connection error — {str(e)}")
+        yield ("failed", f"Stream connection error: {str(e)}")
     
