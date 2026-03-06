@@ -115,6 +115,7 @@ class Pipeline:
         init_db()
         self.id = "lfbrain"
         self.name = "Welcome to lfbrain"
+        self.type = "manifold"
         self.valves = self.Valves()
         self.orchestrator_url = "http://lfbrain-orchestrator:8081"
 
@@ -122,6 +123,7 @@ class Pipeline:
         try:
             with httpx.Client() as client:
                 response = client.get(f"{self.orchestrator_url}/models", timeout=5.0)
+                response.raise_for_status()  # ← add this to catch non-200 responses
                 models = response.json().get("data", [])
                 return [{"id": f"lfbrain.{m['id']}", "name": f"LFBrain / {m['id']}"} for m in models]
         except Exception as e:
