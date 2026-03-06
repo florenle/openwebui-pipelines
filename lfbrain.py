@@ -7,8 +7,8 @@
 #   inlet(): Branch-safe sync of SQLite against body["messages"]. Creates chat, updates title,
 #            persists model_hint from body["model"], handles file uploads, injects lfbrain_chat_id,
 #            strips message ids.
-#   pipe(): Creates block, submits job, streams status as <think>...</think>,
-#           writes assistant content. Slash commands handled inline.
+#   pipe(): Creates block, streams tokens live via stream_job_http(). Think and answer chunks
+#           yielded immediately. Slash commands handled inline.
 #   outlet(): True no-op except delete_job().
 #
 # Dependencies:
@@ -18,17 +18,18 @@
 # Dev Notes:
 #   pipe() is a sync Generator - async pipe is not supported in pipelines framework.
 #   __event_emitter__ is not supported in pipelines framework.
-#   stream_job() yields ("result", value) or ("failed", value) sentinels.
-#   GeneratorExit handled in pipe() for stop button press — sends kill_job() to orchestrator.
+#   pipe() drives async stream_job_http() via a dedicated asyncio event loop.
+#   GeneratorExit handled in pipe() — closes async generator via loop.run_until_complete(agen.aclose()).
 #   lfbrain_chat_id is injected by inlet() into body — pipe() cannot access chat_id directly.
 #   outlet() uses body.get("chat_id") directly — OpenWebUI always provides it there.
-#   system_content is ephemeral — streamed as <think>...</think>, never stored.
-#   owui_message_id is the sync key for branch reconciliation.
+#   think chunks accumulated and wrapped in <think>...</think> tags.
+#   token chunks accumulated for update_block_assistant().
 #   model_hint is read from body["model"] in inlet(), stripped of "lfbrain." prefix, persisted to DB.
 #   pipe() reads model_hint from get_chat() — falls back to DEFAULT_MODEL if missing.
 #
-# Schema: LFB03052026A
+# Schema: LFB03052026B
 
+import asyncio
 import os
 import re
 import sys
@@ -55,8 +56,8 @@ from lfb_sqlite_blocks import (
     upsert_block,
     delete_blocks_from_seq,
 )
-from lfb_sqlite_jobs import create_job, get_active_job_by_chat, delete_job
-from lfb_orchestrator import submit_job, stream_job, kill_job
+from lfb_sqlite_jobs import get_active_job_by_chat, delete_job
+from lfb_orchestrator import stream_job_http, kill_job
 from lfb_commands import handle_command
 from lfb_log import log
 
@@ -217,53 +218,73 @@ class Pipeline:
             return
 
         model_hint = (get_chat(chat_id) or {}).get("model_hint", DEFAULT_MODEL)
-        job_id = None
-        try:
-            job_id = submit_job(
-                self.orchestrator_url,
-                query=user_message,
-                context=self._build_context(messages),
-                model_hint=model_hint,
-            )
-            create_job(job_id, block_id, chat_id)
-            yield f"<think>{self.ts()} ; Job submitted (id: {job_id[:8]}...) model: {model_hint}\n"
-        except Exception as e:
-            log("lfbrain", f"pipe — orchestrator error: {e}")
-            yield f"<think>{self.ts()} ; Orchestrator error: {str(e)}</think>"
-            return
+        log("lfbrain", f"pipe — model_hint={model_hint}")
 
+        loop = asyncio.new_event_loop()
+        agen = stream_job_http(
+            self.orchestrator_url,
+            query=user_message,
+            context=self._build_context(messages),
+            model_hint=model_hint,
+        )
+
+        think_buf = []
+        answer_buf = []
+        think_open = False
         assistant_result = None
-        think_open = True
+
         try:
-            for item in stream_job(self.orchestrator_url, job_id, self.ts):
-                if isinstance(item, tuple) and item[0] == "result":
+            while True:
+                try:
+                    kind, chunk = loop.run_until_complete(agen.__anext__())
+                except StopAsyncIteration:
+                    break
+
+                if kind == "think":
+                    if not think_open:
+                        yield "<think>"
+                        think_open = True
+                    think_buf.append(chunk)
+                    yield chunk
+
+                elif kind == "token":
                     if think_open:
                         yield "</think>"
                         think_open = False
-                    assistant_result = item[1]
-                    yield assistant_result
-                elif isinstance(item, tuple) and item[0] == "failed":
-                    error_line = f"{self.ts()} ; Failed: {item[1]}\n"
+                    answer_buf.append(chunk)
+                    yield chunk
+
+                elif kind == "failed":
                     if think_open:
-                        yield error_line + "</think>"
+                        yield "</think>"
                         think_open = False
-                    else:
-                        yield error_line
-                    assistant_result = f"FAILED: {item[1]}"
-                else:
-                    yield item
+                    error_msg = f"{self.ts()} ; Failed: {chunk}"
+                    yield error_msg
+                    answer_buf.append(f"FAILED: {chunk}")
+                    break
+
         except GeneratorExit:
             log("lfbrain", "pipe — GeneratorExit: stream interrupted by user")
-            if job_id:
-                try:
-                    kill_job(self.orchestrator_url, job_id)
-                    log("lfbrain", f"pipe — kill_job sent for job_id={job_id[:8]}")
-                except Exception as e:
-                    log("lfbrain", f"pipe — kill_job error: {e}")
+            try:
+                loop.run_until_complete(agen.aclose())
+                log("lfbrain", "pipe — async generator closed cleanly")
+            except Exception as e:
+                log("lfbrain", f"pipe — agen.aclose() error: {e}")
             if think_open:
                 yield f"{self.ts()} ; Stream interrupted by user\n</think>"
-            assistant_result = assistant_result or "FAILED: interrupted by user"
+            if not answer_buf:
+                answer_buf.append("FAILED: interrupted by user")
+
         finally:
+            if think_open:
+                yield "</think>"
+            loop.close()
+            think_text = "".join(think_buf)
+            answer_text = "".join(answer_buf)
+            if think_text:
+                assistant_result = f"<think>{think_text}</think>\n{answer_text}"
+            else:
+                assistant_result = answer_text
             if assistant_result:
                 log("lfbrain", f"pipe — writing assistant result len={len(assistant_result)}")
                 update_block_assistant(block_id, assistant_result)
@@ -277,3 +298,4 @@ class Pipeline:
                 delete_job(job["job_id"])
                 log("lfbrain", f"outlet — deleted job {job['job_id'][:8]}...")
         return body
+    
