@@ -225,11 +225,19 @@ class Pipeline:
         log("lfbrain", f"pipe — model_hint={model_hint}")
 
         # Bridge async stream_job_http() into sync pipe() via a dedicated thread + queue.
-        # asyncio.run() in the thread creates its own event loop, isolated from anyio.
+        # Manual loop management (instead of asyncio.run) lets us cancel the task from
+        # outside the thread on GeneratorExit, which closes the httpx connection to the
+        # orchestrator — Starlette detects the disconnect and cancels stream_job_tokens(),
+        # which closes the connection to llama-server (broken pipe → llama-server stops).
         q: queue.Queue = queue.Queue()
+        _task_ref: list = []
+        _loop_ref: list = []
+        _stream_ready = threading.Event()
 
         def _run_stream():
             async def _consume():
+                _task_ref.append(asyncio.current_task())
+                _stream_ready.set()
                 try:
                     async for item in stream_job_http(
                         self.orchestrator_url,
@@ -238,11 +246,18 @@ class Pipeline:
                         model_hint=model_hint,
                     ):
                         q.put(item)
+                except asyncio.CancelledError:
+                    log("lfbrain", "pipe — stream task cancelled")
                 except Exception as e:
                     q.put(("failed", str(e)))
                 finally:
                     q.put(("done", None))
-            asyncio.run(_consume())
+            loop = asyncio.new_event_loop()
+            _loop_ref.append(loop)
+            try:
+                loop.run_until_complete(_consume())
+            finally:
+                loop.close()
 
         threading.Thread(target=_run_stream, daemon=True).start()
 
@@ -283,8 +298,14 @@ class Pipeline:
 
         except GeneratorExit:
             # Do not yield here — GeneratorExit forbids it.
-            # Thread will drain naturally. httpx stream closes via agen garbage collection.
-            log("lfbrain", "pipe — GeneratorExit: stop consuming queue")
+            # Cancel the stream task so httpx closes the connection to the orchestrator.
+            # Starlette detects client disconnect → cancels stream_job_tokens() →
+            # cancels _stream_llamaserver() → closes httpx connection to llama-server →
+            # broken pipe on next token write → llama-server stops.
+            log("lfbrain", "pipe — GeneratorExit: cancelling stream task")
+            _stream_ready.wait(timeout=2)
+            if _loop_ref and _task_ref:
+                _loop_ref[0].call_soon_threadsafe(_task_ref[0].cancel)
             if not answer_buf:
                 answer_buf.append("FAILED: interrupted by user")
 
