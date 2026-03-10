@@ -29,8 +29,13 @@
 #   token chunks accumulated for update_block_assistant().
 #   model_hint is read from body["model"] in inlet(), stripped of "lfbrain." prefix, persisted to DB.
 #   pipe() reads model_hint from get_chat() — falls back to DEFAULT_MODEL if missing.
+#   LFB03102026A: answer_started flag prevents re-opening <think> mid-answer.
+#   Providers never resume reasoning_content once content starts — guard is for queue reordering only.
+#   Late think chunks are buffered for DB but never yielded as a tag.
+#   LFB03102026A: token chunks with literal <think>/<\/think> text are escaped via U+200B
+#   to prevent tag_output_handler() regex from treating them as reasoning block delimiters.
 #
-# Schema: LFB03052026B
+# Schema: LFB03102026A
 
 import asyncio
 import os
@@ -67,6 +72,10 @@ from lfb_commands import handle_command
 from lfb_log import log
 
 DEFAULT_MODEL = "local"
+
+# Hold back this many chars in the rolling token buffer to catch cross-chunk <think> patterns.
+# len("</think>") - 1 = 7 guarantees any partial tag at a chunk boundary stays buffered.
+_THINK_TAG_HOLD = len("</think>") - 1  # 7
 
 
 def remove_details(content: str) -> str:
@@ -284,33 +293,62 @@ class Pipeline:
         think_buf = []
         answer_buf = []
         think_open = False
+        answer_started = False  # LFB03102026A: True after first token — providers never resume reasoning_content once content starts
+        token_pending = ""   # LFB03102026A: rolling suffix buffer for cross-chunk <think> escaping
 
         try:
             while True:
                 kind, chunk = out_q.get()
 
                 if kind == "done":
+                    if token_pending:
+                        yield token_pending
+                        token_pending = ""
                     break
 
                 elif kind == "think":
-                    if not think_open:
-                        yield "<think>"
-                        think_open = True
                     think_buf.append(chunk)
-                    yield chunk
+                    if not answer_started:
+                        # Only emit <think> tokens before the first answer token.
+                        # Providers (llamaserver, Groq) never resume reasoning_content once
+                        # content has started — so this guard fires only on queue reordering.
+                        # Re-opening <think> mid-answer would inject an inline
+                        # <details type="reasoning"> block and corrupt structured output.
+                        if not think_open:
+                            yield "<think>"
+                            think_open = True
+                        yield chunk
 
                 elif kind == "token":
                     if think_open:
                         # Close think tag at first token — before any GeneratorExit is possible
                         yield "</think>"
                         think_open = False
+                    answer_started = True
                     answer_buf.append(chunk)
-                    yield chunk
+                    # LFB03102026A: escape literal <think>/<\/think> in answer tokens.
+                    # tag_output_handler() regex matches <think> on accumulated text — the tag
+                    # is typically split across multiple tokens (<, think, >). Per-chunk
+                    # replacement misses cross-chunk patterns, so we use a rolling suffix buffer
+                    # (hold back THINK_TAG_LEN-1 chars) to catch tag formation at boundaries.
+                    # U+200B between < and tag name is invisible but breaks the middleware regex.
+                    # answer_buf retains originals for correct DB storage.
+                    token_pending += chunk
+                    safe = token_pending.replace("<think>", "<\u200bthink>").replace("</think>", "<\u200b/think>")
+                    if len(safe) > _THINK_TAG_HOLD:
+                        yield safe[:-_THINK_TAG_HOLD]
+                        token_pending = safe[-_THINK_TAG_HOLD:]
+                    else:
+                        token_pending = safe
 
                 elif kind == "failed":
+                    if token_pending:
+                        yield token_pending
+                        token_pending = ""
                     if think_open:
                         yield "</think>"
                         think_open = False
+                        answer_started = True
                     error_msg = f"{self.ts()} ; Failed: {chunk}"
                     yield error_msg
                     answer_buf.append(f"FAILED: {chunk}")
@@ -319,6 +357,7 @@ class Pipeline:
         except GeneratorExit:
             # Backup kill path — fires when framework eventually calls .close() on the generator.
             # Primary kill already handled by relay thread after 2s consumer dropout.
+            token_pending = ""  # discard buffered partial output on kill
             log("lfbrain", "pipe — GeneratorExit: cancelling stream task")
             if _loop_ref and _task_ref and not _loop_ref[0].is_closed():
                 _loop_ref[0].call_soon_threadsafe(_task_ref[0].cancel)
