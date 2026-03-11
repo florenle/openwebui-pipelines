@@ -9,7 +9,7 @@
 #   add_block(): Inserts new block, auto-assigns next seq.
 #   get_block(): Returns block row or None.
 #   get_blocks_by_chat(): Returns all blocks for a chat ordered by seq.
-#   update_block_assistant(): Stores final LLM result.
+#   update_block_assistant(): Stores final LLM result. Accepts incomplete flag for interrupted runs.
 #   upsert_block(): Insert or replace by (chat_id, seq).
 #   delete_blocks_from_seq(): Deletes all blocks with seq >= value.
 #   remove_details(): Strips <details>...</details> tags from content.
@@ -24,11 +24,12 @@
 #   seq is auto-assigned as max(seq)+1 per chat at insert time.
 #   block_id is a UUID generated in pipe() at job submission time.
 #   owui_message_id is the OpenWebUI user message ID — used as sync key in inlet().
-#   system_content is ephemeral — streamed as <think>...</think>, never stored.
+#   think content is streamed live as <think>...</think> tags but not stored — OWUI strips
+#   reasoning from assistant messages before sending context back to the LLM.
 #   sync_blocks() clears chat summaries when divergence is detected, so downstream
 #   summarization is not left holding stale context.
 #
-# Schema: LFB03112026A
+# Schema: LFB03112026B
 
 import re
 import uuid
@@ -92,13 +93,14 @@ def get_blocks_by_chat(chat_id):
     return [dict(r) for r in rows]
 
 
-def update_block_assistant(block_id, assistant_content):
-    log("lfb_sqlite_blocks", f"update_block_assistant({block_id[:8]}...) len={len(assistant_content)}")
+def update_block_assistant(block_id: str, assistant_content: str, incomplete: bool = False) -> None:
+    """Persist the final assistant result for a block. Set incomplete=True for interrupted or failed runs."""
+    log("lfb_sqlite_blocks", f"update_block_assistant({block_id[:8]}...) len={len(assistant_content)} incomplete={incomplete}")
     conn = get_conn()
     with conn:
         conn.execute(
-            "UPDATE blocks SET assistant_content = ? WHERE block_id = ?",
-            (assistant_content, block_id)
+            "UPDATE blocks SET assistant_content = ?, incomplete = ? WHERE block_id = ?",
+            (assistant_content, int(incomplete), block_id)
         )
     conn.close()
 

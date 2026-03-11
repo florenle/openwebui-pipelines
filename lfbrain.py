@@ -13,7 +13,7 @@
 #
 # Dependencies:
 #   lfb_OwuiFileHandler, lfb_sqlite, lfb_sqlite_blocks, lfb_sqlite_jobs,
-#   lfb_orchestrator, lfb_commands, lfb_log
+#   lfb_pipeStream, lfb_commands, lfb_log
 #
 # Dev Notes:
 #   pipe() is a sync Generator — async pipe is not supported in the pipelines framework.
@@ -30,7 +30,6 @@
 #
 # Schema: LFB03112026B
 
-import os
 import sys
 import uuid
 import httpx
@@ -52,12 +51,9 @@ from lfb_sqlite_blocks import (
     add_block,
     update_block_assistant,
     get_blocks_by_chat,
-    upsert_block,
-    delete_blocks_from_seq,
     sync_blocks,
 )
 from lfb_sqlite_jobs import get_active_job_by_chat, delete_job
-from lfb_orchestrator import kill_job
 from lfb_commands import handle_command
 from lfb_log import log
 from lfb_pipeStream import bridge_stream
@@ -107,9 +103,6 @@ class Pipeline:
     def ts(self):
         return datetime.now().strftime("%H:%M:%S")
 
-    def get_chat_dir(self, chat_id: str) -> str:
-        return os.path.join(self.valves.target_directory, f"chat_{chat_id}")
-
     def _build_context(self, messages: list[dict]) -> str:
         """Format messages as Role: content transcript for orchestrator context."""
         lines = []
@@ -119,58 +112,54 @@ class Pipeline:
             lines.append(f"{role}: {content}")
         return "\n".join(lines)
 
-    def _get_accurate_prompt_tokens(self, chat_id: str, exclude_block_id: str | None = None) -> int:
-        """Read full chat history from SQLite and count tokens via tiktoken.
-
-        If `exclude_block_id` is provided, that block will be skipped when counting.
-        Returns 0 if encoder unavailable or on error.
-        """
-        if not self.encoder:
-            return 0
-        try:
-            blocks = get_blocks_by_chat(chat_id)
-            full_text_parts = []
-            for b in blocks:
-                if exclude_block_id and b.get("block_id") == exclude_block_id:
-                    continue
-                user = b.get("user_content", "") or ""
-                assistant = b.get("assistant_content", "") or ""
-                if user:
-                    full_text_parts.append(f"User: {user}\n")
-                if assistant:
-                    full_text_parts.append(f"Assistant: {assistant}\n")
-            full_text = "".join(full_text_parts)
-            toks = self.encoder.encode(full_text)
-            return len(toks) + _TOKEN_BOILERPLATE
-        except Exception as e:
-            log("lfbrain", f"_get_accurate_prompt_tokens failed: {e}")
-            return 0
-
     def _compute_usage(
         self,
         chat_id: str,
         block_id: str,
         llm_usage: dict | None,
-        think_buf: list[str],
         answer_buf: list[str],
     ) -> dict:
-        """Build a usage dict from DB prompt tokens + provider or estimated completion tokens.
+        """Build a usage dict from provider report when available, tiktoken estimate on interruption.
 
-        Used in all exit paths (done, failed, interrupted) so the frontend
-        context pie always receives a non-zero snapshot.
+        Provider llm_usage is accurate — includes orchestrator system prompt and think tokens.
+        Tiktoken fallback is used only when llm_usage is absent (e.g. stream interrupted before
+        usage event arrives). Fallback undercounts prompt by ~orchestrator system prompt overhead
+        but is acceptable for the interrupted case.
         """
-        prompt_tokens = self._get_accurate_prompt_tokens(chat_id, exclude_block_id=block_id)
-        if llm_usage and llm_usage.get("completion_tokens") is not None:
-            completion_tokens = llm_usage["completion_tokens"]
-        else:
-            answer_text = "".join(think_buf) + "".join(answer_buf)
-            if self.encoder:
-                try:
-                    completion_tokens = len(self.encoder.encode(answer_text))
-                except Exception:
-                    completion_tokens = max(0, len(answer_text) // 4)
-            else:
+        if llm_usage:
+            return {
+                "prompt_tokens": llm_usage["prompt_tokens"],
+                "completion_tokens": llm_usage["completion_tokens"],
+                "total_tokens": llm_usage["total_tokens"],
+            }
+
+        # Fallback: tiktoken estimate from SQLite history + answer_buf.
+        # Used only on interruption when provider usage event has not yet arrived.
+        prompt_tokens = 0
+        if self.encoder:
+            try:
+                blocks = get_blocks_by_chat(chat_id)
+                parts = []
+                for b in blocks:
+                    if b.get("block_id") == block_id:
+                        continue
+                    if b.get("user_content"):
+                        parts.append(f"User: {b['user_content']}\n")
+                    if b.get("assistant_content"):
+                        parts.append(f"Assistant: {b['assistant_content']}\n")
+                prompt_tokens = len(self.encoder.encode("".join(parts))) + _TOKEN_BOILERPLATE
+            except Exception as e:
+                log("lfbrain", f"_compute_usage prompt count failed: {e}")
+
+        answer_text = "".join(answer_buf)
+        if self.encoder:
+            try:
+                completion_tokens = len(self.encoder.encode(answer_text))
+            except Exception:
                 completion_tokens = max(0, len(answer_text) // 4)
+        else:
+            completion_tokens = max(0, len(answer_text) // 4)
+
         return {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
@@ -250,27 +239,8 @@ class Pipeline:
                 ):
                     result_lines.append(chunk)
                     yield chunk
-                try:
-                    accurate_pt = self._get_accurate_prompt_tokens(chat_id, exclude_block_id=block_id)
-                    answer_text = "".join(result_lines)
-                    encoder = getattr(self, "encoder", None)
-                    if encoder is not None:
-                        try:
-                            accurate_ct = len(encoder.encode(answer_text))
-                        except Exception as e:
-                            log("lfbrain", f"slash answer encode failed: {e}")
-                            accurate_ct = max(0, len(answer_text) // 4)
-                    else:
-                        accurate_ct = max(0, len(answer_text) // 4)
-
-                    _usage = {
-                        "prompt_tokens": accurate_pt,
-                        "completion_tokens": accurate_ct,
-                        "total_tokens": accurate_pt + accurate_ct,
-                    }
-                    yield {"usage": _usage}
-                except Exception as e:
-                    log("lfbrain", f"pipe (slash) — failed to compute usage: {e}")
+                _usage = self._compute_usage(chat_id, block_id, None, result_lines)
+                yield {"usage": _usage}
             finally:
                 update_block_assistant(block_id, "".join(result_lines))
             return
@@ -278,12 +248,12 @@ class Pipeline:
         model_hint = (get_chat(chat_id) or {}).get("model_hint", DEFAULT_MODEL)
         log("lfbrain", f"pipe — model_hint={model_hint}")
 
-        think_buf = []
         answer_buf = []
         think_open = False
         answer_started = False
         llm_usage: dict | None = None
-        interrupted = False  # set True on GeneratorExit so finally can emit usage
+        incomplete = False       # set True on failed or interrupted runs for DB flagging
+        needs_usage_emit = False  # set True only on GeneratorExit — failed path emits usage inline
 
         try:
             for kind, chunk in bridge_stream(
@@ -293,7 +263,7 @@ class Pipeline:
                 model_hint=model_hint,
             ):
                 if kind == "done":
-                    _usage = self._compute_usage(chat_id, block_id, llm_usage, think_buf, answer_buf)
+                    _usage = self._compute_usage(chat_id, block_id, llm_usage, answer_buf)
                     log("lfbrain", f"pipe — usage: {_usage['prompt_tokens']}+{_usage['completion_tokens']}={_usage['total_tokens']}")
                     yield {"usage": _usage}
                     break
@@ -302,7 +272,6 @@ class Pipeline:
                     llm_usage = chunk
 
                 elif kind == "think":
-                    think_buf.append(chunk)
                     if not answer_started:
                         if not think_open:
                             yield "<think>"
@@ -316,7 +285,7 @@ class Pipeline:
                     if not answer_started:
                         # Emit usage at first token so context pie is non-zero on interruption.
                         # completion_tokens=0 here; done event updates it accurately on completion.
-                        _early_usage = self._compute_usage(chat_id, block_id, llm_usage, think_buf, [])
+                        _early_usage = self._compute_usage(chat_id, block_id, llm_usage, [])
                         yield {"usage": _early_usage}
                     answer_started = True
                     answer_buf.append(chunk)
@@ -331,31 +300,31 @@ class Pipeline:
                     error_msg = f"{self.ts()} ; Failed: {chunk}"
                     yield error_msg
                     answer_buf.append(f"FAILED: {chunk}")
-                    _usage = self._compute_usage(chat_id, block_id, llm_usage, think_buf, answer_buf)
+                    incomplete = True
+                    _usage = self._compute_usage(chat_id, block_id, llm_usage, answer_buf)
                     yield {"usage": _usage}
                     break
 
         except GeneratorExit:
             # Backup kill path — fires when framework calls .close() on the generator.
             # Primary kill handled by bridge_stream()'s relay thread after 2s consumer dropout.
-            interrupted = True
+            incomplete = True
+            needs_usage_emit = True
             log("lfbrain", "pipe — GeneratorExit")
             if not answer_buf:
                 answer_buf.append("FAILED: interrupted by user")
 
         finally:
-            if interrupted:
-                # Emit usage so frontend context pie shows non-zero on interruption.
-                _usage = self._compute_usage(chat_id, block_id, llm_usage, think_buf, answer_buf)
+            if needs_usage_emit:
+                # Emit usage on GeneratorExit — failed path already emits inline.
+                _usage = self._compute_usage(chat_id, block_id, llm_usage, answer_buf)
                 log("lfbrain", f"pipe — interrupted usage: {_usage['prompt_tokens']}+{_usage['completion_tokens']}")
                 yield {"usage": _usage}
 
-            think_text = "".join(think_buf)
-            answer_text = "".join(answer_buf)
-            assistant_result = f"<think>{think_text}</think>{answer_text}" if think_text else answer_text
+            assistant_result = "".join(answer_buf)
             if assistant_result:
-                log("lfbrain", f"pipe — writing assistant result len={len(assistant_result)}")
-                update_block_assistant(block_id, assistant_result)
+                log("lfbrain", f"pipe — writing assistant result len={len(assistant_result)} incomplete={incomplete}")
+                update_block_assistant(block_id, assistant_result, incomplete=incomplete)
 
     async def outlet(self, body: dict, __user__: dict) -> dict:
         chat_id = body.get("chat_id") or body.get("metadata", {}).get("chat_id")

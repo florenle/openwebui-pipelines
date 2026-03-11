@@ -26,7 +26,7 @@
 #   Foreign keys enforced — deleting a chat cascades to blocks, jobs, docs
 #   Slash command turns are never written to the DB
 #
-# Schema: LFB03052026A
+# Schema: LFB03112026A
 
 import sqlite3
 from datetime import datetime, timezone
@@ -65,6 +65,7 @@ def init_db():
                 owui_message_id   TEXT,
                 user_content      TEXT,
                 assistant_content TEXT,
+                incomplete        INTEGER NOT NULL DEFAULT 0,
                 created_at        TEXT NOT NULL,
                 FOREIGN KEY (chat_id) REFERENCES chats(chat_id) ON DELETE CASCADE,
                 UNIQUE (chat_id, seq)
