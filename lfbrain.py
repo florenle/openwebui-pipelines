@@ -286,6 +286,29 @@ class Pipeline:
                 ):
                     result_lines.append(chunk)
                     yield chunk
+                # Emit usage info for slash commands so frontend pie retains prior value
+                try:
+                    accurate_pt = self._get_accurate_prompt_tokens(chat_id, exclude_block_id=block_id)
+                    answer_text = "".join(result_lines)
+                    encoder = getattr(self, "encoder", None)
+                    if encoder is not None:
+                        try:
+                            accurate_ct = len(encoder.encode(answer_text))
+                        except Exception as e:
+                            log("lfbrain", f"slash answer encode failed: {e}")
+                            accurate_ct = max(0, len(answer_text) // 4)
+                    else:
+                        accurate_ct = max(0, len(answer_text) // 4)
+
+                    _usage = {
+                        "prompt_tokens": accurate_pt,
+                        "completion_tokens": accurate_ct,
+                        "total_tokens": accurate_pt + accurate_ct,
+                    }
+                    log("lfbrain", f"pipe (slash) — emitting usage: {accurate_pt}+{accurate_ct}={accurate_pt+accurate_ct}")
+                    yield {"usage": _usage}
+                except Exception as e:
+                    log("lfbrain", f"pipe (slash) — failed to compute usage: {e}")
             finally:
                 update_block_assistant(block_id, "".join(result_lines))
             return
