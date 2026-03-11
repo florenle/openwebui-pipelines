@@ -7,7 +7,7 @@
 #   inlet(): Branch-safe sync of SQLite against body["messages"]. Creates chat, updates title,
 #            persists model_hint from body["model"], handles file uploads, injects lfbrain_chat_id,
 #            strips message ids.
-#   pipe(): Creates block, streams tokens live via stream_job_http(). Think and answer chunks
+#   pipe(): Creates block, streams tokens live via bridge_stream(). Think and answer chunks
 #           yielded immediately. Slash commands handled inline.
 #   outlet(): True no-op except delete_job().
 #
@@ -16,34 +16,22 @@
 #   lfb_orchestrator, lfb_commands, lfb_log
 #
 # Dev Notes:
-#   pipe() is a sync Generator - async pipe is not supported in pipelines framework.
+#   pipe() is a sync Generator — async pipe is not supported in the pipelines framework.
 #   __event_emitter__ is not supported in pipelines framework.
-#   pipe() bridges async stream_job_http() via threading.Thread + two-queue back-pressure design.
-#   stream thread → q (unbounded) → relay thread → out_q (maxsize=8) → pipe() yields.
-#   relay thread detects consumer dropout via out_q.put(timeout=2.0) → cancels stream task.
-#   Kill is independent of GeneratorExit timing — fires ~2s after consumer stops calling next().
-#   </think> closed at first token chunk — before GeneratorExit can interfere.
-#   lfbrain_chat_id is injected by inlet() into body — pipe() cannot access chat_id directly.
+#   pipe() calls bridge_stream() (lfb_pipeStream) which owns all threading, queue,
+#   cancel, and token buffering logic. pipe() only consumes normalized events.
+#   lfbrain_chat_id is injected by inlet() into body — pipe() reads it from body.
 #   outlet() uses body.get("chat_id") directly — OpenWebUI always provides it there.
-#   think chunks accumulated and wrapped in <think>...</think> tags.
-#   token chunks accumulated for update_block_assistant().
-#   model_hint is read from body["model"] in inlet(), stripped of "lfbrain." prefix and context_window
-#   suffix (e.g. "lfbrain.local.32768" → "local"), persisted to DB.
+#   model_hint is read from body["model"] in inlet(), stripped of "lfbrain." prefix and
+#   context_window suffix (e.g. "lfbrain.local.32768" → "local"), persisted to DB.
 #   pipe() reads model_hint from get_chat() — falls back to DEFAULT_MODEL if missing.
-#   LFB03102026A: answer_started flag prevents re-opening <think> mid-answer.
-#   Providers never resume reasoning_content once content starts — guard is for queue reordering only.
-#   Late think chunks are buffered for DB but never yielded as a tag.
-#   LFB03102026A: token chunks with literal <think>/<\/think> text are escaped via U+200B
-#   to prevent tag_output_handler() regex from treating them as reasoning block delimiters.
+#   answer_started flag prevents re-opening <think> mid-answer (LFB03102026A).
+#   Usage snapshot emitted at first token so context pie is non-zero on interruption.
 #
 # Schema: LFB03112026B
 
-import asyncio
 import os
-import queue
-import re
 import sys
-import threading
 import uuid
 import httpx
 from datetime import datetime
@@ -69,15 +57,13 @@ from lfb_sqlite_blocks import (
     sync_blocks,
 )
 from lfb_sqlite_jobs import get_active_job_by_chat, delete_job
-from lfb_orchestrator import stream_job_http, kill_job
+from lfb_orchestrator import kill_job
 from lfb_commands import handle_command
 from lfb_log import log
+from lfb_pipeStream import bridge_stream
 
 DEFAULT_MODEL = "local"
 
-# Hold back this many chars in the rolling token buffer to catch cross-chunk <think> patterns.
-# len("</think>") - 1 = 7 guarantees any partial tag at a chunk boundary stays buffered.
-_THINK_TAG_HOLD = len("</think>") - 1  # 7
 # Small overhead to approximate system/template tokens not stored in DB
 _TOKEN_BOILERPLATE = 20
 
@@ -292,87 +278,21 @@ class Pipeline:
         model_hint = (get_chat(chat_id) or {}).get("model_hint", DEFAULT_MODEL)
         log("lfbrain", f"pipe — model_hint={model_hint}")
 
-        # Bridge async stream_job_http() into sync pipe() via thread + two-queue back-pressure design.
-        #
-        # Architecture:
-        #   stream thread  →  q (unbounded)  →  relay thread  →  out_q (maxsize=8)  →  pipe() yields
-        #
-        # Kill mechanism (independent of GeneratorExit timing):
-        #   When the consumer stops calling next(), out_q fills up.
-        #   relay thread's out_q.put(timeout=2.0) raises queue.Full after 2 seconds.
-        #   relay thread calls call_soon_threadsafe(task.cancel) → httpx closes → orchestrator
-        #   detects disconnect → stream cancelled → llama-server gets broken pipe → stops.
-        q: queue.Queue = queue.Queue()
-        out_q: queue.Queue = queue.Queue(maxsize=8)
-        _task_ref: list = []
-        _loop_ref: list = []
-
-        def _run_stream():
-            async def _consume():
-                _task_ref.append(asyncio.current_task())
-                try:
-                    async for item in stream_job_http(
-                        self.orchestrator_url,
-                        query=user_message,
-                        context=self._build_context(messages),
-                        model_hint=model_hint,
-                    ):
-                        q.put(item)
-                except asyncio.CancelledError:
-                    log("lfbrain", "pipe — stream task cancelled")
-                except Exception as e:
-                    q.put(("failed", str(e)))
-                finally:
-                    q.put(("done", None))
-
-            loop = asyncio.new_event_loop()
-            _loop_ref.append(loop)
-            loop.run_until_complete(_consume())
-
-        def _relay():
-            """Move q → out_q. If out_q stays full for 2s, consumer dropped — cancel stream."""
-            while True:
-                kind, chunk = q.get()
-                while True:
-                    try:
-                        out_q.put((kind, chunk), timeout=2.0)
-                        break
-                    except queue.Full:
-                        log("lfbrain", "pipe — relay: consumer dropped, cancelling stream")
-                        if _loop_ref and _task_ref and not _loop_ref[0].is_closed():
-                            _loop_ref[0].call_soon_threadsafe(_task_ref[0].cancel)
-                        # Drain out_q so we can push the done sentinel.
-                        # out_q is full (that's why we're here) — clear it first,
-                        # then push done so pipe()'s while loop emits usage and exits cleanly.
-                        try:
-                            while not out_q.empty():
-                                out_q.get_nowait()
-                        except Exception:
-                            pass
-                        out_q.put(("done", None))
-                        return
-                if kind == "done":
-                    return
-
-        threading.Thread(target=_run_stream, daemon=True).start()
-        threading.Thread(target=_relay, daemon=True).start()
-
         think_buf = []
         answer_buf = []
         think_open = False
         answer_started = False
-        token_pending = ""
         llm_usage: dict | None = None
         interrupted = False  # set True on GeneratorExit so finally can emit usage
 
         try:
-            while True:
-                kind, chunk = out_q.get()
-
+            for kind, chunk in bridge_stream(
+                self.orchestrator_url,
+                query=user_message,
+                context=self._build_context(messages),
+                model_hint=model_hint,
+            ):
                 if kind == "done":
-                    if token_pending:
-                        yield token_pending
-                        token_pending = ""
                     _usage = self._compute_usage(chat_id, block_id, llm_usage, think_buf, answer_buf)
                     log("lfbrain", f"pipe — usage: {_usage['prompt_tokens']}+{_usage['completion_tokens']}={_usage['total_tokens']}")
                     yield {"usage": _usage}
@@ -394,30 +314,16 @@ class Pipeline:
                         yield "</think>"
                         think_open = False
                     if not answer_started:
-                        # Emit a usage snapshot at the first token so the context pie
-                        # shows a non-zero value even if the stream is interrupted before done.
-                        # completion_tokens=0 here; the final done event updates it accurately.
+                        # Emit usage at first token so context pie is non-zero on interruption.
+                        # completion_tokens=0 here; done event updates it accurately on completion.
                         _early_usage = self._compute_usage(chat_id, block_id, llm_usage, think_buf, [])
                         yield {"usage": _early_usage}
                     answer_started = True
                     answer_buf.append(chunk)
-                    # Escape literal <think>/</think> in answer tokens via U+200B so
-                    # tag_output_handler() regex doesn't treat them as reasoning delimiters.
-                    # Rolling suffix buffer (THINK_TAG_HOLD chars) catches tags split across chunks.
-                    token_pending += chunk
-                    safe = token_pending.replace("<think>", "<\u200bthink>").replace(
-                        "</think>", "<\u200b/think>"
-                    )
-                    if len(safe) > _THINK_TAG_HOLD:
-                        yield safe[:-_THINK_TAG_HOLD]
-                        token_pending = safe[-_THINK_TAG_HOLD:]
-                    else:
-                        token_pending = safe
+                    # Token escaping and buffering handled by bridge_stream() — yield directly.
+                    yield chunk
 
                 elif kind == "failed":
-                    if token_pending:
-                        yield token_pending
-                        token_pending = ""
                     if think_open:
                         yield "</think>"
                         think_open = False
@@ -431,30 +337,22 @@ class Pipeline:
 
         except GeneratorExit:
             # Backup kill path — fires when framework calls .close() on the generator.
-            # Primary kill already handled by relay thread after 2s consumer dropout.
-            # Cannot yield here — GeneratorExit forbids it. Usage is emitted in finally instead.
-            token_pending = ""
+            # Primary kill handled by bridge_stream()'s relay thread after 2s consumer dropout.
             interrupted = True
-            log("lfbrain", "pipe — GeneratorExit: cancelling stream task")
-            if _loop_ref and _task_ref and not _loop_ref[0].is_closed():
-                _loop_ref[0].call_soon_threadsafe(_task_ref[0].cancel)
+            log("lfbrain", "pipe — GeneratorExit")
             if not answer_buf:
                 answer_buf.append("FAILED: interrupted by user")
 
         finally:
             if interrupted:
-                # Emit usage snapshot so frontend context pie shows non-zero on interruption.
-                # Safe to yield here — finally runs outside the GeneratorExit except block.
+                # Emit usage so frontend context pie shows non-zero on interruption.
                 _usage = self._compute_usage(chat_id, block_id, llm_usage, think_buf, answer_buf)
                 log("lfbrain", f"pipe — interrupted usage: {_usage['prompt_tokens']}+{_usage['completion_tokens']}")
                 yield {"usage": _usage}
 
             think_text = "".join(think_buf)
             answer_text = "".join(answer_buf)
-            if think_text:
-                assistant_result = f"<think>{think_text}</think>{answer_text}"
-            else:
-                assistant_result = answer_text
+            assistant_result = f"<think>{think_text}</think>{answer_text}" if think_text else answer_text
             if assistant_result:
                 log("lfbrain", f"pipe — writing assistant result len={len(assistant_result)}")
                 update_block_assistant(block_id, assistant_result)
