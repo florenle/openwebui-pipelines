@@ -36,7 +36,7 @@
 #   LFB03102026A: token chunks with literal <think>/<\/think> text are escaped via U+200B
 #   to prevent tag_output_handler() regex from treating them as reasoning block delimiters.
 #
-# Schema: LFB03102026A
+# Schema: LFB03112026A
 
 import asyncio
 import os
@@ -67,6 +67,7 @@ from lfb_sqlite_blocks import (
     get_blocks_by_chat,
     upsert_block,
     delete_blocks_from_seq,
+    sync_blocks,
 )
 from lfb_sqlite_jobs import get_active_job_by_chat, delete_job
 from lfb_orchestrator import stream_job_http, kill_job
@@ -82,54 +83,6 @@ _THINK_TAG_HOLD = len("</think>") - 1  # 7
 _TOKEN_BOILERPLATE = 20
 
 
-def remove_details(content: str) -> str:
-    return re.sub(r"<details[^>]*>.*?</details>", "", content, flags=re.DOTALL).strip()
-
-
-def sync_blocks(chat_id: str, body_messages: list[dict]):
-    """Reconcile SQLite blocks against the active branch in body['messages']."""
-    owui_pairs = []
-    for i in range(0, len(body_messages) - 1, 2):
-        user_msg = body_messages[i]
-        assistant_msg = body_messages[i + 1]
-        owui_pairs.append(
-            {
-                "owui_message_id": user_msg.get("id"),
-                "user_content": user_msg.get("content", ""),
-                "assistant_content": remove_details(assistant_msg.get("content", "")),
-            }
-        )
-
-    db_blocks = get_blocks_by_chat(chat_id)
-
-    divergence = None
-    for i, (owui, db) in enumerate(zip(owui_pairs, db_blocks)):
-        if owui["owui_message_id"] != db.get("owui_message_id"):
-            divergence = i
-            break
-
-    if divergence is None and len(db_blocks) > len(owui_pairs):
-        divergence = len(owui_pairs)
-
-    if divergence is not None:
-        delete_blocks_from_seq(chat_id, divergence + 1)
-        for idx, pair in enumerate(owui_pairs[divergence:]):
-            upsert_block(
-                chat_id,
-                divergence + idx + 1,
-                pair["owui_message_id"],
-                pair["user_content"],
-                pair["assistant_content"],
-            )
-        clear_chat_summaries(chat_id)
-        log(
-            "lfbrain",
-            f"sync_blocks — divergence at {divergence}, resynced {len(owui_pairs) - divergence} pairs",
-        )
-    else:
-        log("lfbrain", "sync_blocks — no divergence")
-
-
 class Pipeline:
     class Valves(BaseModel):
         target_directory: str = "/home/florenle/x/dev/openwebui/chats"
@@ -142,9 +95,8 @@ class Pipeline:
         self.type = "manifold"
         self.valves = self.Valves()
         self.orchestrator_url = "http://lfbrain-orchestrator:8081"
-        # LFB03102026B: initialize tiktoken encoder for accurate prompt token counts.
+        # Initialize tiktoken encoder for accurate prompt token counts.
         try:
-            # Use cl100k_base as a general-purpose encoder compatible with many models
             self.encoder = tiktoken.get_encoding("cl100k_base")
         except Exception as e:
             log("lfbrain", f"tiktoken init failed: {e}")
@@ -194,11 +146,8 @@ class Pipeline:
             blocks = get_blocks_by_chat(chat_id)
             full_text_parts = []
             for b in blocks:
-                # Optionally skip the current block (prevents double-count if it's
-                # already been written to SQLite by another concurrent path).
                 if exclude_block_id and b.get("block_id") == exclude_block_id:
                     continue
-                # Reconstruct a simple transcript that mirrors what the model sees
                 user = b.get("user_content", "") or ""
                 assistant = b.get("assistant_content", "") or ""
                 if user:
@@ -206,7 +155,6 @@ class Pipeline:
                 if assistant:
                     full_text_parts.append(f"Assistant: {assistant}\n")
             full_text = "".join(full_text_parts)
-            # encode returns list of token ids
             toks = self.encoder.encode(full_text)
             return len(toks) + _TOKEN_BOILERPLATE
         except Exception as e:
@@ -286,7 +234,6 @@ class Pipeline:
                 ):
                     result_lines.append(chunk)
                     yield chunk
-                # Emit usage info for slash commands so frontend pie retains prior value
                 try:
                     accurate_pt = self._get_accurate_prompt_tokens(chat_id, exclude_block_id=block_id)
                     answer_text = "".join(result_lines)
@@ -305,7 +252,6 @@ class Pipeline:
                         "completion_tokens": accurate_ct,
                         "total_tokens": accurate_pt + accurate_ct,
                     }
-                    log("lfbrain", f"pipe (slash) — emitting usage: {accurate_pt}+{accurate_ct}={accurate_pt+accurate_ct}")
                     yield {"usage": _usage}
                 except Exception as e:
                     log("lfbrain", f"pipe (slash) — failed to compute usage: {e}")
@@ -322,11 +268,10 @@ class Pipeline:
         #   stream thread  →  q (unbounded)  →  relay thread  →  out_q (maxsize=8)  →  pipe() yields
         #
         # Kill mechanism (independent of GeneratorExit timing):
-        #   When the consumer (OpenWebUI) stops calling next() on the generator, out_q fills up.
+        #   When the consumer stops calling next(), out_q fills up.
         #   relay thread's out_q.put(timeout=2.0) raises queue.Full after 2 seconds.
         #   relay thread calls call_soon_threadsafe(task.cancel) → httpx closes → orchestrator
-        #   detects disconnect → stream_job_tokens() cancelled → llama-server gets broken pipe → stops.
-        #   This fires ~2s after consumer dropout, regardless of when GeneratorExit arrives.
+        #   detects disconnect → stream cancelled → llama-server gets broken pipe → stops.
         q: queue.Queue = queue.Queue()
         out_q: queue.Queue = queue.Queue(maxsize=8)
         _task_ref: list = []
@@ -363,13 +308,10 @@ class Pipeline:
                         out_q.put((kind, chunk), timeout=2.0)
                         break
                     except queue.Full:
-                        log(
-                            "lfbrain",
-                            "pipe — relay: consumer dropped, cancelling stream",
-                        )
+                        log("lfbrain", "pipe — relay: consumer dropped, cancelling stream")
                         if _loop_ref and _task_ref and not _loop_ref[0].is_closed():
                             _loop_ref[0].call_soon_threadsafe(_task_ref[0].cancel)
-                        return  # stream kill done — relay exits
+                        return
                 if kind == "done":
                     return
 
@@ -379,13 +321,9 @@ class Pipeline:
         think_buf = []
         answer_buf = []
         think_open = False
-        answer_started = False  # LFB03102026A: True after first token — providers never resume reasoning_content once content starts
-        token_pending = (
-            ""  # LFB03102026A: rolling suffix buffer for cross-chunk <think> escaping
-        )
-        llm_usage: dict | None = (
-            None  # LFB03102026B: real token counts from LLM provider (filled by "usage" event)
-        )
+        answer_started = False
+        token_pending = ""
+        llm_usage: dict | None = None
 
         try:
             while True:
@@ -395,25 +333,10 @@ class Pipeline:
                     if token_pending:
                         yield token_pending
                         token_pending = ""
-                    # Emit token usage so the context pie can show fill level.
-                    # pipe() only receives the current user message — OpenWebUI does not send
-                    # the full conversation history to lfbrain (history lives in SQLite).
-                    # A char-estimate of `messages` is therefore always just the current query
-                    # and gives a meaningless count (e.g. "hi" → 1 token every turn).
-                    # Use real LLM usage when available:
-                    #   Groq: prompt_tokens = full cumulative context (accurate).
-                    #   llamaserver: prompt_tokens = incremental only (KV cache) but still
-                    #     grows meaningfully across turns and is far better than 1.
-                    # Compute accurate prompt token count from DB using tiktoken.
-                    # Use provider completion_tokens when available, else fallback to char-estimate.
-                    # Exclude the current block from DB counting to avoid double-count
-                    # if the assistant result is already persisted by a concurrent path.
                     accurate_pt = self._get_accurate_prompt_tokens(chat_id, exclude_block_id=block_id)
-                    # Compute current reply tokens: prefer provider-reported, else use tiktoken on answer_buf
                     if llm_usage and llm_usage.get("completion_tokens") is not None:
                         accurate_ct = llm_usage["completion_tokens"]
                     else:
-                        # Include reasoning content (think_buf) so the pie reflects total work
                         answer_text = "".join(think_buf) + "".join(answer_buf)
                         encoder = getattr(self, "encoder", None)
                         if encoder is not None:
@@ -430,25 +353,16 @@ class Pipeline:
                         "completion_tokens": accurate_ct,
                         "total_tokens": accurate_pt + accurate_ct,
                     }
-                    log("lfbrain", f"Usage sync: {accurate_pt} (DB) + {accurate_ct} (Current) = {accurate_pt + accurate_ct}")
-                    log(
-                        "lfbrain",
-                        f"usage-dbg: msgs={len(messages)} prompt_chars={sum(len(str(m.get('content',''))) for m in messages)} llm_usage={llm_usage} emitting={_usage}",
-                    )
+                    log("lfbrain", f"pipe — usage: {accurate_pt}+{accurate_ct}={accurate_pt + accurate_ct}")
                     yield {"usage": _usage}
                     break
 
                 elif kind == "usage":
-                    llm_usage = chunk  # store real counts; emitted at "done"
+                    llm_usage = chunk
 
                 elif kind == "think":
                     think_buf.append(chunk)
                     if not answer_started:
-                        # Only emit <think> tokens before the first answer token.
-                        # Providers (llamaserver, Groq) never resume reasoning_content once
-                        # content has started — so this guard fires only on queue reordering.
-                        # Re-opening <think> mid-answer would inject an inline
-                        # <details type="reasoning"> block and corrupt structured output.
                         if not think_open:
                             yield "<think>"
                             think_open = True
@@ -456,18 +370,13 @@ class Pipeline:
 
                 elif kind == "token":
                     if think_open:
-                        # Close think tag at first token — before any GeneratorExit is possible
                         yield "</think>"
                         think_open = False
                     answer_started = True
                     answer_buf.append(chunk)
-                    # LFB03102026A: escape literal <think>/<\/think> in answer tokens.
-                    # tag_output_handler() regex matches <think> on accumulated text — the tag
-                    # is typically split across multiple tokens (<, think, >). Per-chunk
-                    # replacement misses cross-chunk patterns, so we use a rolling suffix buffer
-                    # (hold back THINK_TAG_LEN-1 chars) to catch tag formation at boundaries.
-                    # U+200B between < and tag name is invisible but breaks the middleware regex.
-                    # answer_buf retains originals for correct DB storage.
+                    # Escape literal <think>/</think> in answer tokens via U+200B so
+                    # tag_output_handler() regex doesn't treat them as reasoning delimiters.
+                    # Rolling suffix buffer (THINK_TAG_HOLD chars) catches tags split across chunks.
                     token_pending += chunk
                     safe = token_pending.replace("<think>", "<\u200bthink>").replace(
                         "</think>", "<\u200b/think>"
@@ -492,9 +401,9 @@ class Pipeline:
                     break
 
         except GeneratorExit:
-            # Backup kill path — fires when framework eventually calls .close() on the generator.
+            # Backup kill path — fires when framework calls .close() on the generator.
             # Primary kill already handled by relay thread after 2s consumer dropout.
-            token_pending = ""  # discard buffered partial output on kill
+            token_pending = ""
             log("lfbrain", "pipe — GeneratorExit: cancelling stream task")
             if _loop_ref and _task_ref and not _loop_ref[0].is_closed():
                 _loop_ref[0].call_soon_threadsafe(_task_ref[0].cancel)
@@ -509,10 +418,7 @@ class Pipeline:
             else:
                 assistant_result = answer_text
             if assistant_result:
-                log(
-                    "lfbrain",
-                    f"pipe — writing assistant result len={len(assistant_result)}",
-                )
+                log("lfbrain", f"pipe — writing assistant result len={len(assistant_result)}")
                 update_block_assistant(block_id, assistant_result)
 
     async def outlet(self, body: dict, __user__: dict) -> dict:
