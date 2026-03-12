@@ -15,6 +15,8 @@
 #   Files are stored at <target_dir>/chat_<chat_id>/docs/<filename>
 #   LFB02242026B: filename-exists check replaced with doc_exists() from SQLite
 #   add_doc() called after successful copy to track file metadata in DB
+#
+# Schema: LFB03112026A
 
 import os
 import shutil

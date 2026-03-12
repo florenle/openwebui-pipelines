@@ -11,12 +11,14 @@
 # Dev Notes:
 #   Set DEBUG=true in docker-compose.yml pipelines environment to enable.
 #   All modules import log() from here — no direct print() calls.
+#
+# Schema: LFB03112026A
 
 import os
 
 DEBUG = os.environ.get("DEBUG", "false").lower() == "true"
 
+
 def log(module: str, msg: str):
     if DEBUG:
         print(f"LFDEBUG [{module}]: {msg}", flush=True)
-
