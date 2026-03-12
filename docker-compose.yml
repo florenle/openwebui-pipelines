@@ -52,6 +52,15 @@ services:
     networks:
       - backend-net
 
+  redis:
+      image: redis:7-alpine
+      container_name: redis
+      ports:
+        - "6379:6379"
+      restart: unless-stopped
+      networks:
+        - backend-net
+
 networks:
   backend-net:
     driver: bridge
