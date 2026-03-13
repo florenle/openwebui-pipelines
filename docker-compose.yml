@@ -61,6 +61,19 @@ services:
       networks:
         - backend-net
 
+  lfbrain-agent:
+      build: /home/florenle/x/dev/openwebui/lfbrain-agent
+      container_name: lfbrain-agent
+      ports:
+        - "8082:8082"
+      environment:
+        - REDIS_URL=redis://redis:6379/0
+      depends_on:
+        - redis
+      restart: unless-stopped
+      networks:
+        - backend-net        
+
 networks:
   backend-net:
     driver: bridge

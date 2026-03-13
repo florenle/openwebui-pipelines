@@ -2,9 +2,7 @@
 # start-all.sh
 # Deploys and starts the full lfbrain stack.
 # Usage: cd ~/x/dev/openwebui && ./lfbrain-pipeline/start-all.sh
-
 set -e
-
 ROOT="/home/florenle/x/dev/openwebui"
 
 # Step 2: Build my-open-webui
@@ -21,10 +19,14 @@ echo "=== Building lfbrain-orchestrator ==="
 cd $ROOT/lfbrain-orchestrator
 ./build.sh
 
-# Step 5: Start all services
+# Step 5: Build lfbrain-agent
+echo "=== Building lfbrain-agent ==="
+cd $ROOT/lfbrain-agent
+./build.sh
+
+# Step 6: Start all services
 echo "=== Starting all services ==="
 cd $ROOT/lfbrain-pipeline
-# docker rm -f lfbrain-orchestrator pipelines open-webui 2>/dev/null || true
 docker compose down
 docker compose up -d
 
@@ -36,14 +38,12 @@ cd $ROOT/lfbrain-pipeline
 # Diagnostics
 echo ""
 echo "=== Diagnostics ==="
-
 echo "-- Podman toolbox container --"
 if podman ps | grep -q "llama-vulkan-radv"; then
     echo "llama-vulkan-radv container: UP"
 else
     echo "llama-vulkan-radv container: DOWN"
 fi
-
 echo "-- llama_server --"
 if curl -s http://localhost:8080/health > /dev/null 2>&1; then
     echo "llama_server: RUNNING on port 8080"
@@ -55,6 +55,17 @@ else
     echo "  2. toolbox enter llama-vulkan-radv"
     echo "  3. llama-server -m ~/models/gpt-oss-20b/gpt-oss-20b-Q4_K_M.gguf -ngl 999 --host 0.0.0.0 --port 8080 -c 32768 --jinja   --reasoning-format auto   --chat-template-kwargs '{\"reasoning_effort\": \"medium\"}'"
 fi
-
+echo "-- Redis --"
+if docker ps | grep -q "redis"; then
+    echo "redis: UP on port 6379"
+else
+    echo "redis: DOWN"
+fi
+echo "-- lfbrain-agent --"
+if curl -s http://localhost:8082/health > /dev/null 2>&1; then
+    echo "lfbrain-agent: RUNNING on port 8082"
+else
+    echo "lfbrain-agent: NOT RUNNING"
+fi
 echo ""
 echo "=== Done ==="
